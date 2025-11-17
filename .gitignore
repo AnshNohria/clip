@@ -1,0 +1,53 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Virtual Environment
+clip-venv/
+venv/
+env/
+ENV/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Environment variables
+.env
+.env.local
+
+# Model Cache
+hf_cache/
+llava_cache/
+RemoteCLIP_checkpoints/
+
+# Outputs
+outputs/
+results/
+*.png
+*.jpg
+*.jpeg
+
+# Datasets (large files - should be downloaded separately)
+datasets/rsicd_images/
+datasets/UCM_captions/
+datasets/WHURS19/
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.temp
