@@ -32,12 +32,8 @@ RemoteCLIP_checkpoints/
 # Outputs
 outputs/
 results/
-*.png
-*.jpg
-*.jpeg
 
 # Datasets (large files - should be downloaded separately)
-datasets/rsicd_images/
 datasets/UCM_captions/
 datasets/WHURS19/
 
