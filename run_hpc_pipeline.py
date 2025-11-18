@@ -180,7 +180,7 @@ class Qwen2VLCaptioner:
                 "role": "user",
                 "content": [
                     {"type": "image", "image": str(image_path)},
-                    {"type": "text", "text": "Describe this aerial/satellite image. What is the scene type and what features are visible?"}
+                    {"type": "text", "text": "Describe this aerial image concisely in 2-3 sentences: scene type, main structures, and key features."}
                 ]
             }]
             
@@ -196,7 +196,11 @@ class Qwen2VLCaptioner:
             
             with torch.no_grad():
                 generated_ids = self.model.generate(
-                    **inputs, max_new_tokens=80, do_sample=True, temperature=0.7,
+                    **inputs, 
+                    max_new_tokens=60,      # Shorter for better SD3.5 prompts
+                    do_sample=True, 
+                    temperature=0.5,        # More focused
+                    top_p=0.85,
                     pad_token_id=self.processor.tokenizer.pad_token_id,
                     eos_token_id=self.processor.tokenizer.eos_token_id
                 )
@@ -212,6 +216,9 @@ class Qwen2VLCaptioner:
             )
             
             caption = output[0].strip() if output else "Aerial view"
+            # Clean up verbose phrases
+            caption = caption.replace("The image shows ", "").replace("The scene shows ", "")
+            caption = caption.replace("This is ", "").replace("It is ", "")
             print(f"    ✓ Caption: {caption[:70]}...")
             return caption
         except Exception as e:
@@ -257,13 +264,20 @@ class GroundingDINODetector:
             
             inputs = self.processor(
                 images=image, text=text_prompt, return_tensors="pt"
-            ).to(device)
+            )
+            
+            # Move inputs to device with correct dtype
+            input_ids = inputs.input_ids.to(device) if hasattr(inputs, 'input_ids') else inputs['input_ids'].to(device)
+            pixel_values = inputs.pixel_values.to(device, dtype=torch.float32) if hasattr(inputs, 'pixel_values') else inputs['pixel_values'].to(device, dtype=torch.float32)
+            
+            # Cast model to float32 for inference to match input dtype
+            self.model = self.model.float()
             
             with torch.no_grad():
-                outputs = self.model(**inputs)
+                outputs = self.model(pixel_values=pixel_values, input_ids=input_ids)
             
             results = self.processor.post_process_grounded_object_detection(
-                outputs, inputs.input_ids, text_threshold=0.25,
+                outputs, input_ids, text_threshold=0.25,
                 target_sizes=[image.size[::-1]]
             )[0]
             
@@ -562,6 +576,14 @@ Create a natural aerial view prompt that includes scene type, key objects with c
             words = combined.split()
             if len(words) > self.config.MAX_FINAL_PROMPT_WORDS:
                 combined = " ".join(words[:self.config.MAX_FINAL_PROMPT_WORDS])
+            
+            # Final check: Keep under 70 tokens (SD3.5 CLIP limit is 77)
+            tokens_estimate = len(combined.split())
+            if tokens_estimate > 65:
+                # Aggressively trim to fit
+                words = combined.split()
+                combined = " ".join(words[:60])  # Safe limit
+                print(f"    ⚠ Trimmed prompt from ~{tokens_estimate} to ~60 words for SD3.5")
             
             print(f"    ✓ Combined prompt: {combined}")
             return combined
