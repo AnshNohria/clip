@@ -61,10 +61,13 @@ class Config:
     GUIDANCE_SCALE = 4.5  # SD3.5 recommended guidance scale
     MAX_FINAL_PROMPT_WORDS = 40  # For CLIP limit
     
-    # Detection classes
+    # Detection classes - expanded for better aerial imagery detection
     DETECT_CLASSES = [
-        "building", "road", "vehicle", "tree", "water", "field",
-        "airplane", "ship", "bridge", "parking lot"
+        "building", "house", "road", "street", "highway", "vehicle", "car",
+        "tree", "forest", "water", "river", "pond", "lake", "field", "farmland",
+        "airplane", "ship", "boat", "bridge", "parking lot", "factory", "warehouse",
+        "residential area", "commercial area", "industrial area", "park", "garden",
+        "railway", "stadium", "airport", "harbor", "port"
     ]
     
     def __init__(self):
@@ -240,10 +243,11 @@ class GroundingDINODetector:
             self.processor = AutoProcessor.from_pretrained(
                 config.GROUNDING_DINO_MODEL, cache_dir=str(config.CACHE_DIR)
             )
+            # Use float32 for stable inference
             self.model = AutoModelForZeroShotObjectDetection.from_pretrained(
                 config.GROUNDING_DINO_MODEL,
                 cache_dir=str(config.CACHE_DIR),
-                torch_dtype=torch.float16
+                torch_dtype=torch.float32
             ).to(device).eval()
             
             print("✓ Grounding DINO loaded")
@@ -264,20 +268,15 @@ class GroundingDINODetector:
             
             inputs = self.processor(
                 images=image, text=text_prompt, return_tensors="pt"
-            )
-            
-            # Move inputs to device with correct dtype
-            input_ids = inputs.input_ids.to(device) if hasattr(inputs, 'input_ids') else inputs['input_ids'].to(device)
-            pixel_values = inputs.pixel_values.to(device, dtype=torch.float32) if hasattr(inputs, 'pixel_values') else inputs['pixel_values'].to(device, dtype=torch.float32)
-            
-            # Cast model to float32 for inference to match input dtype
-            self.model = self.model.float()
+            ).to(device)
             
             with torch.no_grad():
-                outputs = self.model(pixel_values=pixel_values, input_ids=input_ids)
+                outputs = self.model(**inputs)
             
             results = self.processor.post_process_grounded_object_detection(
-                outputs, input_ids, text_threshold=0.25,
+                outputs, inputs.input_ids, 
+                box_threshold=0.25,
+                text_threshold=0.2,
                 target_sizes=[image.size[::-1]]
             )[0]
             
@@ -319,10 +318,11 @@ class PreciseLocalizer:
             import torch
             
             self.processor = SamProcessor.from_pretrained(sam_model_name)
+            # Use float32 for compatibility with DINO
             self.model = SamModel.from_pretrained(
                 sam_model_name,
-                torch_dtype=torch.float16
-            ).to(device)
+                torch_dtype=torch.float32
+            ).to(device).eval()
             
             print("✓ SAM loaded successfully")
             print(f"  ✓ GPU Memory: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
@@ -365,16 +365,20 @@ class PreciseLocalizer:
                     img_array,
                     input_boxes=[[[box.tolist()]]],
                     return_tensors="pt"
-                ).to("cuda")
+                )
+                
+                # Move to device
+                inputs = {k: v.to(device) for k, v in inputs.items()}
                 
                 with torch.no_grad():
                     outputs = self.model(**inputs)
                 
-                # Get mask
-                masks = self.processor.image_processor.post_process_masks(
+                # Get mask - post_process_masks is in processor, not image_processor
+                masks = self.processor.post_process_masks(
                     outputs.pred_masks.cpu(),
                     inputs["original_sizes"].cpu(),
-                    inputs["reshaped_input_sizes"].cpu()
+                    inputs["reshaped_input_sizes"].cpu(),
+                    binarize=False
                 )[0]
                 
                 # Get the best mask
@@ -647,8 +651,15 @@ class SD35ImageGenerator:
             print(f"  Resolution: {self.config.OUTPUT_IMAGE_SIZE}x{self.config.OUTPUT_IMAGE_SIZE}")
             print(f"  Steps: {self.config.NUM_INFERENCE_STEPS} (optimized for SD3.5)")
             
+            # Add quality enhancers for aerial imagery
+            enhanced_prompt = f"{prompt}, high quality aerial photography, detailed, sharp focus, professional"
+            
+            # Negative prompt for better quality
+            negative_prompt = "blurry, low quality, distorted, deformed, ugly, bad anatomy, watermark, text"
+            
             image = self.pipe(
-                prompt=prompt,
+                prompt=enhanced_prompt,
+                negative_prompt=negative_prompt,
                 height=self.config.OUTPUT_IMAGE_SIZE,
                 width=self.config.OUTPUT_IMAGE_SIZE,
                 num_inference_steps=self.config.NUM_INFERENCE_STEPS,
