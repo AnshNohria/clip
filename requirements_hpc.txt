@@ -1,25 +1,27 @@
 # HPC Pipeline Requirements
 # SkyEyeGPT → Grounding DINO → Text2Earth
 
-# Core PyTorch (CPU version for HPC)
---index-url https://download.pytorch.org/whl/cpu
-torch==2.5.0+cpu
-torchvision==0.20.0+cpu
-torchaudio==2.5.0+cpu
+# Core PyTorch (CUDA version for GPU servers)
+--index-url https://download.pytorch.org/whl/cu124
+torch==2.6.0+cu124
+torchvision==0.21.0+cu124
 
 # Diffusion models
 diffusers==0.31.0
 accelerate==0.34.2
 safetensors==0.4.5
 
-# Transformers for SkyEyeGPT-7B
+# Transformers for Qwen2-VL, Phi-3.5, etc.
 transformers==4.46.3
 tokenizers==0.20.3
+qwen-vl-utils==0.0.8
 
 # Grounding DINO dependencies
-# Note: Install from source after environment setup
-# git clone https://github.com/IDEA-Research/GroundingDINO.git
+supervision==0.24.0
 groundingdino-py==0.4.0
+
+# SAM (Segment Anything Model)
+segment-anything==1.0
 
 # Image processing
 Pillow==11.0.0

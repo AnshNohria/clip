@@ -36,6 +36,8 @@ results/
 # Datasets (large files - should be downloaded separately)
 datasets/UCM_captions/
 datasets/WHURS19/
+datasets/*.csv
+datasets/*.txt
 
 # System files
 .DS_Store
