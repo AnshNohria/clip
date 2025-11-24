@@ -59,7 +59,7 @@ class Config:
     OUTPUT_IMAGE_SIZE = 1024  # SD3.5 supports 1024x1024
     NUM_INFERENCE_STEPS = 28  # Optimized for SD3.5 Medium
     GUIDANCE_SCALE = 4.5  # SD3.5 recommended guidance scale
-    MAX_FINAL_PROMPT_WORDS = 40  # For CLIP limit
+    MAX_FINAL_PROMPT_WORDS = 300  # Increased for detailed SD3.5 prompts
     
     # Detection classes - expanded for better aerial imagery detection
     DETECT_CLASSES = [
@@ -86,8 +86,6 @@ class RealESRGANUpscaler:
         print("\n[1/6] Loading Real-ESRGAN Upscaler...")
         
         try:
-            # Real-ESRGAN uses BasicSR, not transformers pipeline
-            # We'll use a simple PyTorch-based upscaling as alternative
             import torch.nn.functional as F
             
             self.upscale_factor = config.UPSCALE_FACTOR
@@ -200,9 +198,9 @@ class Qwen2VLCaptioner:
             with torch.no_grad():
                 generated_ids = self.model.generate(
                     **inputs, 
-                    max_new_tokens=60,      # Shorter for better SD3.5 prompts
+                    max_new_tokens=60,
                     do_sample=True, 
-                    temperature=0.5,        # More focused
+                    temperature=0.5,
                     top_p=0.85,
                     pad_token_id=self.processor.tokenizer.pad_token_id,
                     eos_token_id=self.processor.tokenizer.eos_token_id
@@ -518,7 +516,7 @@ class SmartPromptCombiner:
             enhanced_summary = detection_results.get('summary', '')
             
             # Build detailed prompt for Phi-3.5 with all context
-            prompt = f"""Combine the following aerial image information into ONE concise prompt (max 40 words) for image generation:
+            prompt = f"""Combine the following aerial image information into ONE detailed prompt for image generation:
 
 Scene Description: {caption}
 
@@ -526,7 +524,7 @@ Detected Objects: {counts_text} (Total: {total})
 
 Spatial Layout: {enhanced_summary}
 
-Create a natural aerial view prompt that includes scene type, key objects with counts, and their spatial positions:"""
+Create a natural, detailed aerial view prompt that explicitly mentions the scene type, lists the detected objects with their counts, and describes their spatial positions:"""
             
             inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
             
@@ -537,12 +535,12 @@ Create a natural aerial view prompt that includes scene type, key objects with c
             with torch.no_grad():
                 outputs = self.model.generate(
                     **inputs,
-                    max_new_tokens=60,  # Increased from 30 to 40 for more detailed output
-                    do_sample=False,  # Deterministic for consistency
+                    max_new_tokens=300,
+                    do_sample=False,
                     pad_token_id=self.tokenizer.eos_token_id,
                     eos_token_id=self.tokenizer.eos_token_id,
-                    use_cache=False,  # Fix for DynamicCache error
-                    num_beams=1  # Greedy decoding (faster)
+                    use_cache=False,
+                    num_beams=1
                 )
             
             print("    ✓ Generation complete")
@@ -565,7 +563,7 @@ Create a natural aerial view prompt that includes scene type, key objects with c
                     combined += f" featuring {counts_text}"
                 if enhanced_summary and "Spatial layout:" in enhanced_summary:
                     spatial_info = enhanced_summary.split("Spatial layout:")[-1].strip()
-                    if spatial_info and len(spatial_info) < 50:
+                    if spatial_info:
                         combined += f", {spatial_info}"
                 print(f"    ⚠ Using enhanced fallback prompt")
             
@@ -580,14 +578,6 @@ Create a natural aerial view prompt that includes scene type, key objects with c
             words = combined.split()
             if len(words) > self.config.MAX_FINAL_PROMPT_WORDS:
                 combined = " ".join(words[:self.config.MAX_FINAL_PROMPT_WORDS])
-            
-            # Final check: Keep under 70 tokens (SD3.5 CLIP limit is 77)
-            tokens_estimate = len(combined.split())
-            if tokens_estimate > 65:
-                # Aggressively trim to fit
-                words = combined.split()
-                combined = " ".join(words[:60])  # Safe limit
-                print(f"    ⚠ Trimmed prompt from ~{tokens_estimate} to ~60 words for SD3.5")
             
             print(f"    ✓ Combined prompt: {combined}")
             return combined
@@ -663,7 +653,8 @@ class SD35ImageGenerator:
                 height=self.config.OUTPUT_IMAGE_SIZE,
                 width=self.config.OUTPUT_IMAGE_SIZE,
                 num_inference_steps=self.config.NUM_INFERENCE_STEPS,
-                guidance_scale=self.config.GUIDANCE_SCALE
+                guidance_scale=self.config.GUIDANCE_SCALE,
+                max_sequence_length=512  # Allow up to 512 tokens (uses T5 encoder)
             ).images[0]
             
             image.save(output_path)
