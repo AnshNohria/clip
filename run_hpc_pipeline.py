@@ -81,13 +81,13 @@ class Config:
         self.CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 # ============================================================================
-# STAGE 0: Real-ESRGAN Upscaler
+# STAGE 0: Bicubic Upscaler
 # ============================================================================
 
 class RealESRGANUpscaler:
     def __init__(self, config):
         self.config = config
-        print("\n[1/6] Loading Real-ESRGAN Upscaler...")
+        print("\n[1/6] Loading Bicubic Upscaler...")
         
         try:
             import torch.nn.functional as F
@@ -95,11 +95,10 @@ class RealESRGANUpscaler:
             self.upscale_factor = config.UPSCALE_FACTOR
             self.device = device
             
-            print(f"✓ Real-ESRGAN fallback loaded (upscale factor: {config.UPSCALE_FACTOR}x)")
-            print("  ℹ Using PyTorch bicubic upsampling (high quality)")
+            print(f"✓ Bicubic upscaler loaded (upscale factor: {config.UPSCALE_FACTOR}x)")
             
         except Exception as e:
-            print(f"Error loading Real-ESRGAN: {e}")
+            print(f"Error loading upscaler: {e}")
             raise
     
     def upscale_image(self, image):
@@ -323,7 +322,7 @@ class GroundingDINODetector:
             return {"counts": {}, "summary": "", "total": 0, "results": None}
 
 # ============================================================================
-# STAGE 2B: SAM Precise Localizer
+# STAGE 3: SAM Precise Localizer
 # ============================================================================
 
 class PreciseLocalizer:
@@ -482,7 +481,7 @@ class PreciseLocalizer:
         return "; ".join(desc_parts[:5])
 
 # ============================================================================
-# STAGE 3: Phi-3.5-mini Smart Prompt Combiner (NEW!)
+# STAGE 4: Template-based Prompt Combiner
 # ============================================================================
 
 class SmartPromptCombiner:
@@ -559,7 +558,7 @@ class SmartPromptCombiner:
             return f"Aerial view: {caption}"
 
 # ============================================================================
-# STAGE 4: SDXL + ControlNet Image Generator (NEW!)
+# STAGE 5: SDXL + ControlNet Image Generator
 # ============================================================================
 
 class SDXLControlNetGenerator:
@@ -617,24 +616,24 @@ class SDXLControlNetGenerator:
         """
         Create canny edge map from image for ControlNet
         This preserves the structure and layout of the original image
+        Uses PIL and scipy instead of cv2 to avoid libGL dependency on servers
         """
-        import cv2
         import numpy as np
-        
-        # Convert PIL to numpy
-        image_np = np.array(image)
+        from PIL import ImageFilter, ImageOps
         
         # Convert to grayscale
-        gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
+        gray = ImageOps.grayscale(image)
         
-        # Apply Canny edge detection
-        # Lower threshold = more edges (more control)
-        # Higher threshold = fewer edges (more freedom)
-        edges = cv2.Canny(gray, 100, 200)
+        # Apply edge detection using PIL's FIND_EDGES filter
+        # Then enhance with CONTOUR for better results
+        edges = gray.filter(ImageFilter.FIND_EDGES)
+        edges = edges.filter(ImageFilter.CONTOUR)
         
-        # Convert back to PIL RGB
-        edges_rgb = cv2.cvtColor(edges, cv2.COLOR_GRAY2RGB)
-        control_image = Image.fromarray(edges_rgb)
+        # Enhance contrast to make edges more visible
+        edges = ImageOps.autocontrast(edges)
+        
+        # Convert back to RGB for ControlNet
+        control_image = edges.convert('RGB')
         
         return control_image
     
@@ -711,7 +710,7 @@ class SDXLControlNetGenerator:
 class EnhancedPipeline:
     def __init__(self):
         self.config = Config()
-        print("\nInitializing Enhanced 5-Stage Pipeline...")
+        print("\nInitializing Pipeline...")
         
         # Stage 0: Upscaler
         self.upscaler = RealESRGANUpscaler(self.config)
@@ -722,24 +721,24 @@ class EnhancedPipeline:
         # Stage 2: Detector
         self.detector = GroundingDINODetector(self.config)
         
-        # Stage 2B: SAM Localizer
+        # Stage 3: SAM Localizer
         self.localizer = PreciseLocalizer(self.config.SAM_MODEL)
         
-        # Stage 3: Combiner
+        # Stage 4: Combiner
         self.combiner = SmartPromptCombiner(self.config)
         
-        # Stage 4: Image Generator (SDXL + ControlNet)
+        # Stage 5: Image Generator (SDXL + ControlNet)
         self.generator = SDXLControlNetGenerator(self.config)
         
         print("\n" + "=" * 80)
-        print("✓ Enhanced 6-Stage Pipeline Ready!")
-        print("  1. Real-ESRGAN Upscaler (4x)")
-        print("  2. Qwen2-VL-2B Captioner (input image)")
-        print("  3. Grounding DINO Detector")
-        print("  4. SAM Precise Localizer")
-        print("  5. Template-based Combiner")
-        print("  6. SDXL + ControlNet (1024x1024)")
-        print("  7. Qwen2-VL-2B Captioner (output image description)")
+        print("✓ Pipeline Ready!")
+        print("  Stage 0: Bicubic Upscaler (4x)")
+        print("  Stage 1: Qwen2-VL-2B Captioner")
+        print("  Stage 2: Grounding DINO Detector")
+        print("  Stage 3: SAM Precise Localizer")
+        print("  Stage 4: Template-based Combiner")
+        print("  Stage 5: SDXL + ControlNet Generator (1024x1024)")
+        print("  Stage 6: Qwen2-VL-2B Output Description")
         print("=" * 80)
     
     def process_image(self, image_path, image_name):
@@ -754,7 +753,7 @@ class EnhancedPipeline:
             original_image = Image.open(image_path)
             
             # Stage 0: Upscale
-            print("\n[Stage 0/5] Upscaling image with Real-ESRGAN...")
+            print("\n[Stage 0/6] Upscaling image...")
             upscaled_image = self.upscaler.upscale_image(original_image)
             
             # Save upscaled image temporarily for processing
@@ -763,22 +762,22 @@ class EnhancedPipeline:
             print(f"✓ Upscaled image saved: {upscaled_path}")
             
             # Stage 1: Caption (use upscaled image)
-            print("\n[Stage 1/5] Generating caption with Qwen2-VL...")
+            print("\n[Stage 1/6] Generating caption with Qwen2-VL...")
             caption = self.captioner.generate_description(str(upscaled_path))
             
-            # Stage 2A: Detection (use upscaled image)
-            print("\n[Stage 2A/5] Detecting objects with Grounding DINO...")
+            # Stage 2: Detection (use upscaled image)
+            print("\n[Stage 2/6] Detecting objects with Grounding DINO...")
             detection_results = self.detector.detect_and_count(str(upscaled_path))
             
-            # Stage 2B: Precise Localization with SAM
-            print("\n[Stage 2B/5] Getting precise locations with SAM...")
+            # Stage 3: Precise Localization with SAM
+            print("\n[Stage 3/6] Getting precise locations with SAM...")
             location_results = self.localizer.get_precise_locations(
                 upscaled_image,
                 detection_results.get('results')
             )
             
-            # Stage 3: Smart combination with Phi-3.5
-            print("\n[Stage 3/5] Combining all information with Phi-3.5-mini...")
+            # Stage 4: Smart combination with template
+            print("\n[Stage 4/6] Combining prompt with template combiner...")
             
             # Create enhanced detection summary with SAM locations
             enhanced_detection_summary = detection_results['summary']
@@ -791,31 +790,21 @@ class EnhancedPipeline:
                 'summary': enhanced_detection_summary
             })
             
-            # Print full Stage 3 output
+            # Print combined prompt
             print("\n" + "="*80)
-            print("STAGE 3 OUTPUT - FULL COMBINED PROMPT WITH SAM LOCATIONS")
+            print("COMBINED PROMPT")
             print("="*80)
             print(combined_prompt)
             print("="*80)
             
-            # CRITICAL: Clear GPU memory before generation
-            print(f"\n[Stage 3.5/5] Optimizing GPU memory for image generation...")
+            # Clear GPU memory before generation
+            print(f"\n  ℹ Clearing GPU memory...")
             import gc
-            
-            # Clear cache but keep models loaded
-            print("  ℹ Clearing GPU cache (keeping models loaded)...")
             torch.cuda.empty_cache()
-            torch.cuda.synchronize()
             gc.collect()
             
-            # Print memory status
-            if torch.cuda.is_available():
-                allocated = torch.cuda.memory_allocated() / 1024**3
-                reserved = torch.cuda.memory_reserved() / 1024**3
-                print(f"  ✓ GPU memory status: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
-            
-            # Stage 4: Image Generation
-            print(f"\n[Stage 4/5] Generating image with SDXL + ControlNet...")
+            # Stage 5: Image Generation
+            print(f"\n[Stage 5/6] Generating image with SDXL + ControlNet...")
             output_path = self.config.OUTPUT_DIR / "images" / f"{image_name}_generated.png"
             
             # Pass upscaled image as control for ControlNet
@@ -826,8 +815,8 @@ class EnhancedPipeline:
             )
             
             if success:
-                # Stage 5: Caption the generated image
-                print(f"\n[Stage 5/5] Generating detailed description of output image with Qwen2-VL...")
+                # Stage 6: Caption the generated image
+                print(f"\n[Stage 6/6] Generating description of output image...")
                 generated_image = Image.open(output_path)
                 
                 # Generate detailed caption of the final output
@@ -909,8 +898,8 @@ def main():
     print("  ✓ Qwen2-VL-2B for RS image captioning")
     print("  ✓ Grounding DINO for zero-shot object detection")
     print("  ✓ SAM for precise 9-grid object localization")
-    print("  ✓ Phi-3.5-mini for intelligent prompt combination")
-    print("  ✓ Stable Diffusion 3.5 Medium (1024x1024, full GPU)")
+    print("  ✓ Template-based prompt combination")
+    print("  ✓ SDXL + ControlNet (1024x1024, edge-guided generation)")
     print("\nServer Requirements:")
     print("  • GPU: 24GB+ VRAM (A10G/A100/H100 recommended)")
     print("  • RAM: 32GB+ system memory")
