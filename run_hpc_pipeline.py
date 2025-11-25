@@ -1,7 +1,18 @@
 #!/usr/bin/env python3
 """
-COMPLETE PIPELINE: Qwen2-VL → Grounding DINO → Phi-3.5 → SD3.5
+COMPLETE PIPELINE: Qwen2-VL → Grounding DINO → SAM → Template Combiner → SD3.5
 Optimized for GPU server execution
+
+IMPORTANT NOTE ABOUT SD3.5 TEXT ENCODERS:
+SD3.5 uses THREE text encoders working in parallel:
+- CLIP-L (77 tokens max) - Shows truncation warnings (IGNORE)
+- CLIP-G (77 tokens max) - Shows truncation warnings (IGNORE)  
+- T5-XXL (512 tokens max) - PRIMARY encoder for long prompts
+
+The CLIP warnings are EXPECTED behavior. The T5-XXL encoder processes your
+full prompt (up to 512 tokens) and is what actually generates the image.
+You will see "Token indices sequence length is longer than 77" warnings - 
+these are SAFE TO IGNORE as long as your prompt is under 512 tokens.
 """
 
 import os
@@ -58,7 +69,7 @@ class Config:
     UPSCALE_FACTOR = 4  # NEW: 4x upscaling
     OUTPUT_IMAGE_SIZE = 1024  # SD3.5 supports 1024x1024
     NUM_INFERENCE_STEPS = 28  # Optimized for SD3.5 Medium
-    GUIDANCE_SCALE = 4.5  # SD3.5 recommended guidance scale
+    GUIDANCE_SCALE = 7.0  # Higher guidance = more accurate to prompt (SD3.5 range: 3.0-9.0)
     MAX_FINAL_PROMPT_WORDS = 300  # Increased for detailed SD3.5 prompts
     
     # Detection classes - expanded for better aerial imagery detection
@@ -450,26 +461,32 @@ class PreciseLocalizer:
             return {"locations": [], "spatial_description": ""}
     
     def _create_spatial_description(self, locations):
-        """Create a natural language description of object locations"""
-        desc_parts = []
-        
-        # Group by position
+        """Create a CONCISE natural language description of object locations"""
+        # Group by position and count objects
         position_groups = {}
         for loc in locations:
             pos = loc['position']
+            obj = loc['object']
             if pos not in position_groups:
-                position_groups[pos] = []
-            position_groups[pos].append(loc['object'])
+                position_groups[pos] = {}
+            position_groups[pos][obj] = position_groups[pos].get(obj, 0) + 1
         
-        # Create descriptions
-        for pos, objects in position_groups.items():
-            if len(objects) == 1:
-                desc_parts.append(f"{objects[0]} in {pos}")
+        # Create concise descriptions with counts
+        desc_parts = []
+        for pos, obj_counts in position_groups.items():
+            if len(obj_counts) == 1:
+                obj, count = list(obj_counts.items())[0]
+                if count == 1:
+                    desc_parts.append(f"{obj} in {pos}")
+                else:
+                    desc_parts.append(f"{count} {obj}s in {pos}")
             else:
-                obj_list = ", ".join(objects[:-1]) + f" and {objects[-1]}"
-                desc_parts.append(f"{obj_list} in {pos}")
+                # Multiple object types in same position
+                obj_strs = [f"{count} {obj}" + ("s" if count > 1 else "") for obj, count in obj_counts.items()]
+                desc_parts.append(f"{', '.join(obj_strs)} in {pos}")
         
-        return "; ".join(desc_parts)
+        # Limit to 5 most important positions to keep prompt short
+        return "; ".join(desc_parts[:5])
 
 # ============================================================================
 # STAGE 3: Phi-3.5-mini Smart Prompt Combiner (NEW!)
@@ -516,15 +533,16 @@ class SmartPromptCombiner:
             if "Spatial layout:" in enhanced_summary:
                 spatial_info = enhanced_summary.split("Spatial layout:")[-1].strip()
             
-            # Build DIRECT template-based combination (more reliable than LLM for structured data)
-            # This ensures ALL detection data is included in the final prompt
+            # Build FULL detailed prompt using ALL model outputs
+            # SD3.5's T5-XXL encoder can handle up to 512 tokens (~400 words)
+            # CLIP encoders will truncate at 77 tokens, but T5 is the primary encoder
             combined = f"Aerial view of {caption.lower()}"
             
-            # Add object counts explicitly
+            # Add ALL object counts
             if counts_text:
                 combined += f" featuring {counts_text}"
             
-            # Add spatial distribution
+            # Add full spatial distribution
             if spatial_info:
                 combined += f". Spatial distribution: {spatial_info}"
             elif enhanced_summary and not spatial_info:
@@ -534,7 +552,8 @@ class SmartPromptCombiner:
             # Add quality enhancers
             combined += ". High quality aerial photography, detailed, sharp focus."
             
-            print(f"    ✓ Template-based combination ({len(combined.split())} words): {combined}")
+            word_count = len(combined.split())
+            print(f"    ✓ Template-based combination ({word_count} words, ~{int(word_count * 1.3)} tokens): {combined[:200]}...")
             return combined
             
         except Exception as e:
@@ -576,6 +595,15 @@ class SD35ImageGenerator:
                 variant="fp16"
             ).to(device)
             
+            # IMPORTANT: SD3.5 uses 3 text encoders:
+            # - text_encoder (CLIP-L): 77 tokens max
+            # - text_encoder_2 (CLIP-G): 77 tokens max  
+            # - text_encoder_3 (T5-XXL): 512 tokens max
+            # The T5 encoder is the PRIMARY one for long prompts
+            
+            print("  ℹ NOTE: You will see CLIP truncation warnings below - these are SAFE TO IGNORE")
+            print("  ℹ SD3.5's T5-XXL encoder (512 tokens) is processing your FULL prompt")
+            
             # Enable attention slicing for memory efficiency on GPU
             print("  ℹ Enabling attention slicing for GPU memory efficiency...")
             self.pipe.enable_attention_slicing()
@@ -589,27 +617,45 @@ class SD35ImageGenerator:
             raise
     
     def generate_image(self, prompt, output_path):
-        """Generate high-quality aerial image using SD3.5 Medium"""
+        """
+        Generate high-quality aerial image using SD3.5 Medium
+        
+        IMPORTANT: SD3.5 uses 3 text encoders in parallel:
+        1. CLIP-L (77 tokens) - will truncate and show warnings (IGNORE these)
+        2. CLIP-G (77 tokens) - will truncate and show warnings (IGNORE these)  
+        3. T5-XXL (512 tokens) - PRIMARY encoder, handles full prompt
+        
+        The CLIP warnings are EXPECTED and can be ignored. The T5-XXL encoder
+        is what actually processes your full prompt for image generation.
+        
+        Note: SD3.5 may still generate more/fewer objects than specified.
+        This is normal diffusion model behavior. To improve:
+        - Increased guidance_scale to 7.0 (done)
+        - Use detailed prompts (done)
+        - Future: ControlNet for exact spatial control
+        """
         try:
             print(f"  Generating image with Stable Diffusion 3.5 Medium...")
-            print(f"  Prompt: {prompt}")
+            print(f"  Prompt ({len(prompt)} chars): {prompt[:150]}...")
             print(f"  Resolution: {self.config.OUTPUT_IMAGE_SIZE}x{self.config.OUTPUT_IMAGE_SIZE}")
             print(f"  Steps: {self.config.NUM_INFERENCE_STEPS} (optimized for SD3.5)")
             
-            # Add quality enhancers for aerial imagery
-            enhanced_prompt = f"{prompt}, high quality aerial photography, detailed, sharp focus, professional"
+            # IMPORTANT: SD3.5 uses T5-XXL as PRIMARY encoder (512 tokens)
+            # CLIP encoders will show warnings but are SECONDARY
+            # The T5 embedding is what matters for long prompts!
             
             # Negative prompt for better quality
             negative_prompt = "blurry, low quality, distorted, deformed, ugly, bad anatomy, watermark, text"
             
+            # Generate with FULL 512-token support via T5 encoder
             image = self.pipe(
-                prompt=enhanced_prompt,
+                prompt=prompt,  # Full detailed prompt (T5 handles it)
                 negative_prompt=negative_prompt,
                 height=self.config.OUTPUT_IMAGE_SIZE,
                 width=self.config.OUTPUT_IMAGE_SIZE,
                 num_inference_steps=self.config.NUM_INFERENCE_STEPS,
                 guidance_scale=self.config.GUIDANCE_SCALE,
-                max_sequence_length=512  # Allow up to 512 tokens (uses T5 encoder)
+                max_sequence_length=512  # T5-XXL encoder supports 512 tokens
             ).images[0]
             
             image.save(output_path)
