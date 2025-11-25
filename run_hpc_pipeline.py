@@ -60,8 +60,8 @@ class Config:
     UPSCALE_FACTOR = 4
     OUTPUT_IMAGE_SIZE = 1024
     NUM_INFERENCE_STEPS = 30  # SDXL needs ~30 steps
-    GUIDANCE_SCALE = 8.5  # Higher = more accurate to prompt
-    CONTROLNET_CONDITIONING_SCALE = 0.7  # How much to follow the edge map (0.0-1.0)
+    GUIDANCE_SCALE = 9.0  # Higher = more accurate to prompt (increased for realism)
+    CONTROLNET_CONDITIONING_SCALE = 0.5  # Reduced to allow more realistic interpretation
     # Increase this to 9.0-10.0 for even more prompt adherence (may reduce creativity)
     MAX_FINAL_PROMPT_WORDS = 300  # Increased for detailed SD3.5 prompts
     
@@ -526,23 +526,21 @@ class SmartPromptCombiner:
                 spatial_info = enhanced_summary.split("Spatial layout:")[-1].strip()
             
             # Build FULL detailed prompt using ALL model outputs
-            # SD3.5's T5-XXL encoder can handle up to 512 tokens (~400 words)
-            # CLIP encoders will truncate at 77 tokens, but T5 is the primary encoder
-            combined = f"Aerial view of {caption.lower()}"
+            combined = f"Realistic aerial photograph of {caption.lower()}"
             
             # Add ALL object counts
             if counts_text:
-                combined += f" featuring {counts_text}"
+                combined += f" with {counts_text}"
             
             # Add full spatial distribution
             if spatial_info:
-                combined += f". Spatial distribution: {spatial_info}"
+                combined += f". Layout: {spatial_info}"
             elif enhanced_summary and not spatial_info:
                 # Use full summary if no spatial layout extracted
                 combined += f". {enhanced_summary}"
             
-            # Add quality enhancers
-            combined += ". High quality aerial photography, detailed, sharp focus."
+            # Add STRONG realism enhancers - critical for avoiding cartoon style
+            combined += ". Photorealistic, satellite imagery style, real world photography, natural lighting, high resolution aerial view, Google Earth style, authentic textures, real buildings and structures."
             
             word_count = len(combined.split())
             print(f"    ✓ Template-based combination ({word_count} words, ~{int(word_count * 1.3)} tokens): {combined[:200]}...")
@@ -674,8 +672,8 @@ class SDXLControlNetGenerator:
             else:
                 control = None
             
-            # Negative prompt
-            negative_prompt = "blurry, low quality, distorted, deformed, ugly, bad anatomy, watermark, text, extra objects, wrong count"
+            # Strong negative prompt to avoid cartoon/artistic styles
+            negative_prompt = "cartoon, anime, illustration, drawing, painting, artistic, stylized, 3d render, cgi, digital art, fake, unrealistic, blurry, low quality, distorted, deformed, watermark, text, oversaturated, toy-like, miniature, tilt-shift, game screenshot, video game"
             
             # Generate with ControlNet
             print(f"  ℹ ControlNet conditioning scale: {self.config.CONTROLNET_CONDITIONING_SCALE}")
