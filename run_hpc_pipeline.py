@@ -2,17 +2,6 @@
 """
 COMPLETE PIPELINE: Qwen2-VL → Grounding DINO → SAM → Template Combiner → SD3.5
 Optimized for GPU server execution
-
-IMPORTANT NOTE ABOUT SD3.5 TEXT ENCODERS:
-SD3.5 uses THREE text encoders working in parallel:
-- CLIP-L (77 tokens max) - Shows truncation warnings (IGNORE)
-- CLIP-G (77 tokens max) - Shows truncation warnings (IGNORE)  
-- T5-XXL (512 tokens max) - PRIMARY encoder for long prompts
-
-The CLIP warnings are EXPECTED behavior. The T5-XXL encoder processes your
-full prompt (up to 512 tokens) and is what actually generates the image.
-You will see "Token indices sequence length is longer than 77" warnings - 
-these are SAFE TO IGNORE as long as your prompt is under 512 tokens.
 """
 
 import os
@@ -43,7 +32,7 @@ torch.cuda.empty_cache()
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb=512'
 
 print("=" * 80)
-print("ENHANCED PIPELINE: Qwen2-VL → Grounding DINO → Phi-3.5 → SD3.5")
+print("ENHANCED PIPELINE: Qwen2-VL → DINO → SAM → SDXL+ControlNet")
 print("=" * 80)
 
 # ============================================================================
@@ -58,18 +47,20 @@ class Config:
     
     # Models
     UPSCALER_MODEL = "PyTorch-Bicubic"  # High-quality bicubic upscaling
-    SAM_MODEL = "facebook/sam-vit-base"  # NEW: Precise localization
+    SAM_MODEL = "facebook/sam-vit-base"  # Precise localization
     QWEN2VL_MODEL = "Qwen/Qwen2-VL-2B-Instruct"
     GROUNDING_DINO_MODEL = "IDEA-Research/grounding-dino-base"
-    PHI_MODEL = "microsoft/Phi-3.5-mini-instruct"  # Smart prompt combiner
-    SD35_MODEL = "stabilityai/stable-diffusion-3.5-medium"  # SD3.5 Medium
+    USE_SDXL_CONTROLNET = True
+    SDXL_MODEL = "stabilityai/stable-diffusion-xl-base-1.0"
+    CONTROLNET_MODEL = "diffusers/controlnet-canny-sdxl-1.0"  # Canny edge control
     
     # Settings
     MAX_IMAGES = 1
-    UPSCALE_FACTOR = 4  # NEW: 4x upscaling
-    OUTPUT_IMAGE_SIZE = 1024  # SD3.5 supports 1024x1024
-    NUM_INFERENCE_STEPS = 28  # Optimized for SD3.5 Medium
-    GUIDANCE_SCALE = 8.5  # Higher = more accurate to prompt (SD3.5 range: 3.0-10.0)
+    UPSCALE_FACTOR = 4
+    OUTPUT_IMAGE_SIZE = 1024
+    NUM_INFERENCE_STEPS = 30  # SDXL needs ~30 steps
+    GUIDANCE_SCALE = 8.5  # Higher = more accurate to prompt
+    CONTROLNET_CONDITIONING_SCALE = 0.7  # How much to follow the edge map (0.0-1.0)
     # Increase this to 9.0-10.0 for even more prompt adherence (may reduce creativity)
     MAX_FINAL_PROMPT_WORDS = 300  # Increased for detailed SD3.5 prompts
     
@@ -567,10 +558,150 @@ class SmartPromptCombiner:
             return f"Aerial view: {caption}"
 
 # ============================================================================
-# STAGE 4: Stable Diffusion 3.5 Medium Image Generator
+# STAGE 4: SDXL + ControlNet Image Generator (NEW!)
 # ============================================================================
 
-class SD35ImageGenerator:
+class SDXLControlNetGenerator:
+    """
+    SDXL with ControlNet for precise spatial control
+    Uses edge detection from upscaled image to maintain structure
+    Much better prompt adherence than text-only generation
+    """
+    
+    def __init__(self, config):
+        self.config = config
+        print("\n[6/6] Loading SDXL + ControlNet...")
+        
+        try:
+            from diffusers import StableDiffusionXLControlNetPipeline, ControlNetModel
+            import gc
+            
+            # Clear GPU memory
+            print("  ℹ Clearing GPU memory for SDXL...")
+            torch.cuda.empty_cache()
+            gc.collect()
+            
+            # Load ControlNet first
+            print("  ℹ Loading ControlNet (Canny edge control)...")
+            self.controlnet = ControlNetModel.from_pretrained(
+                config.CONTROLNET_MODEL,
+                cache_dir=str(config.CACHE_DIR),
+                torch_dtype=torch.float16
+            )
+            
+            # Load SDXL with ControlNet
+            print("  ℹ Loading SDXL base model...")
+            self.pipe = StableDiffusionXLControlNetPipeline.from_pretrained(
+                config.SDXL_MODEL,
+                controlnet=self.controlnet,
+                cache_dir=str(config.CACHE_DIR),
+                torch_dtype=torch.float16,
+                variant="fp16"
+            ).to(device)
+            
+            # Memory optimization
+            print("  ℹ Enabling memory optimizations...")
+            self.pipe.enable_attention_slicing()
+            self.pipe.enable_vae_slicing()
+            
+            print("✓ SDXL + ControlNet loaded")
+            print(f"  ✓ GPU Memory: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
+            print("  ✓ ControlNet: Canny edge detection for spatial control")
+            
+        except Exception as e:
+            print(f"✗ Error loading SDXL + ControlNet: {e}")
+            raise
+    
+    def prepare_control_image(self, image):
+        """
+        Create canny edge map from image for ControlNet
+        This preserves the structure and layout of the original image
+        """
+        import cv2
+        import numpy as np
+        
+        # Convert PIL to numpy
+        image_np = np.array(image)
+        
+        # Convert to grayscale
+        gray = cv2.cvtColor(image_np, cv2.COLOR_RGB2GRAY)
+        
+        # Apply Canny edge detection
+        # Lower threshold = more edges (more control)
+        # Higher threshold = fewer edges (more freedom)
+        edges = cv2.Canny(gray, 100, 200)
+        
+        # Convert back to PIL RGB
+        edges_rgb = cv2.cvtColor(edges, cv2.COLOR_GRAY2RGB)
+        control_image = Image.fromarray(edges_rgb)
+        
+        return control_image
+    
+    def generate_image(self, prompt, output_path, control_image=None):
+        """
+        Generate image with SDXL + ControlNet
+        
+        Args:
+            prompt: Detailed text description
+            output_path: Where to save
+            control_image: Upscaled image to extract structure from
+        
+        ControlNet ensures the generated image follows the structure (edges)
+        of the control_image while using the prompt for content/style.
+        
+        This gives MUCH better prompt adherence than text-only generation!
+        """
+        try:
+            print(f"  Generating image with SDXL + ControlNet...")
+            print(f"  Prompt ({len(prompt)} chars): {prompt[:150]}...")
+            print(f"  Resolution: {self.config.OUTPUT_IMAGE_SIZE}x{self.config.OUTPUT_IMAGE_SIZE}")
+            print(f"  Steps: {self.config.NUM_INFERENCE_STEPS}")
+            
+            if control_image is None:
+                print("  ⚠ Warning: No control image provided, using text-only generation")
+                print("     Prompt adherence will be poor. Pass upscaled image for better results.")
+            
+            # Prepare control image (canny edges)
+            if control_image:
+                print("  ℹ Extracting structure via Canny edge detection...")
+                control = self.prepare_control_image(control_image)
+                control = control.resize((self.config.OUTPUT_IMAGE_SIZE, self.config.OUTPUT_IMAGE_SIZE))
+                
+                # Save control image for debugging
+                control_path = output_path.parent / f"{output_path.stem}_control.png"
+                control.save(control_path)
+                print(f"  ✓ Control image saved: {control_path.name}")
+            else:
+                control = None
+            
+            # Negative prompt
+            negative_prompt = "blurry, low quality, distorted, deformed, ugly, bad anatomy, watermark, text, extra objects, wrong count"
+            
+            # Generate with ControlNet
+            print(f"  ℹ ControlNet conditioning scale: {self.config.CONTROLNET_CONDITIONING_SCALE}")
+            print(f"  ℹ Guidance scale: {self.config.GUIDANCE_SCALE}")
+            
+            image = self.pipe(
+                prompt=prompt,
+                negative_prompt=negative_prompt,
+                image=control,  # Edge map controls structure
+                num_inference_steps=self.config.NUM_INFERENCE_STEPS,
+                controlnet_conditioning_scale=self.config.CONTROLNET_CONDITIONING_SCALE,
+                guidance_scale=self.config.GUIDANCE_SCALE,
+                height=self.config.OUTPUT_IMAGE_SIZE,
+                width=self.config.OUTPUT_IMAGE_SIZE,
+            ).images[0]
+            
+            image.save(output_path)
+            print(f"  ✓ Saved: {output_path.name}")
+            print(f"  ℹ Structure preserved via ControlNet edge map")
+            return True
+            
+        except Exception as e:
+            print(f"  ✗ Error: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
     """
     Stable Diffusion 3.5 Medium generator for high-quality aerial image generation
     """
@@ -692,17 +823,27 @@ class EnhancedPipeline:
         # Stage 3: Combiner
         self.combiner = SmartPromptCombiner(self.config)
         
-        # Stage 4: SD3.5 Medium Generator
-        self.generator = SD35ImageGenerator(self.config)
+        # Stage 4: Image Generator (SDXL + ControlNet OR SD3.5)
+        if self.config.USE_SDXL_CONTROLNET:
+            print("\n  ℹ Using SDXL + ControlNet for precise spatial control")
+            self.generator = SDXLControlNetGenerator(self.config)
+        else:
+            print("\n  ℹ Using SD3.5 Medium (text-only, no spatial control)")
+            self.generator = SD35ImageGenerator(self.config)
         
         print("\n" + "=" * 80)
-        print("✓ Enhanced 5-Stage Pipeline Ready!")
+        print("✓ Enhanced 6-Stage Pipeline Ready!")
         print("  1. Real-ESRGAN Upscaler (4x)")
-        print("  2. Qwen2-VL-2B Captioner")
+        print("  2. Qwen2-VL-2B Captioner (input image)")
         print("  3. Grounding DINO Detector")
         print("  4. SAM Precise Localizer")
-        print("  5. Phi-3.5-mini Combiner")
-        print("  6. Stable Diffusion 3.5 Medium (1024x1024)")
+        print("  5. Template-based Combiner")
+        if self.config.USE_SDXL_CONTROLNET:
+            print("  6. SDXL + ControlNet (1024x1024) ← PRECISE SPATIAL CONTROL")
+            print("  7. Qwen2-VL-2B Captioner (output image description)")
+        else:
+            print("  6. Stable Diffusion 3.5 Medium (1024x1024)")
+            print("  7. Qwen2-VL-2B Captioner (output image description)")
         print("=" * 80)
     
     def process_image(self, image_path, image_name):
@@ -761,11 +902,11 @@ class EnhancedPipeline:
             print(combined_prompt)
             print("="*80)
             
-            # CRITICAL: Clear GPU memory before SD3.5 generation (server has 24GB+)
-            print("\n[Stage 3.5/5] Optimizing GPU memory for SD3.5...")
+            # CRITICAL: Clear GPU memory before generation
+            print(f"\n[Stage 3.5/5] Optimizing GPU memory for image generation...")
             import gc
             
-            # On server GPU (24GB+), just clear cache - don't delete models
+            # Clear cache but keep models loaded
             print("  ℹ Clearing GPU cache (keeping models loaded)...")
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
@@ -777,37 +918,44 @@ class EnhancedPipeline:
                 reserved = torch.cuda.memory_reserved() / 1024**3
                 print(f"  ✓ GPU memory status: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
             
-            # Stage 4: SD3.5 Generation
-            print("\n[Stage 4/5] Generating image with Stable Diffusion 3.5 Medium...")
-            output_path = self.config.OUTPUT_DIR / "images" / f"{image_name}_sd35_gen.png"
-            success = self.generator.generate_image(combined_prompt, output_path)
+            # Stage 4: Image Generation
+            generator_name = "SDXL + ControlNet" if self.config.USE_SDXL_CONTROLNET else "SD3.5 Medium"
+            print(f"\n[Stage 4/5] Generating image with {generator_name}...")
+            output_path = self.config.OUTPUT_DIR / "images" / f"{image_name}_generated.png"
+            
+            # Pass upscaled image as control for ControlNet
+            if self.config.USE_SDXL_CONTROLNET:
+                success = self.generator.generate_image(
+                    combined_prompt, 
+                    output_path,
+                    control_image=upscaled_image  # Use upscaled image for structure
+                )
+            else:
+                success = self.generator.generate_image(combined_prompt, output_path)
             
             if success:
-                # Convert detection_results to JSON-serializable format
-                detection_metadata = {
-                    "counts": detection_results.get("counts", {}),
-                    "summary": detection_results.get("summary", ""),
-                    "total": detection_results.get("total", 0)
-                    # Don't include 'results' key as it contains Tensors
-                }
+                # Stage 5: Caption the generated image
+                print(f"\n[Stage 5/5] Generating detailed description of output image with Qwen2-VL...")
+                generated_image = Image.open(output_path)
+                
+                # Generate detailed caption of the final output
+                output_caption = self.captioner.generate_description(str(output_path))
+                
+                print(f"    ✓ Output description: {output_caption}")
                 
                 metadata = {
                     "source": str(image_path),
-                    "original_size": f"{original_image.size[0]}x{original_image.size[1]}",
-                    "upscaled_size": f"{upscaled_image.size[0]}x{upscaled_image.size[1]}",
-                    "upscale_factor": self.config.UPSCALE_FACTOR,
-                    "qwen2vl_caption": caption,
-                    "grounding_dino_detections": detection_metadata,
-                    "sam_precise_locations": location_results,
-                    "phi35_combined_prompt": combined_prompt,
                     "output": str(output_path),
+                    "output_caption": output_caption,
+                    "generation_prompt": combined_prompt,
                     "models": {
                         "upscaler": self.config.UPSCALER_MODEL,
                         "caption": self.config.QWEN2VL_MODEL,
                         "detection": self.config.GROUNDING_DINO_MODEL,
                         "localizer": self.config.SAM_MODEL,
-                        "combiner": self.config.PHI_MODEL,
-                        "generation": self.config.SD35_MODEL
+                        "combiner": "Template-based",
+                        "generation": self.config.SDXL_MODEL if self.config.USE_SDXL_CONTROLNET else "SD3.5 Medium",
+                        "controlnet": self.config.CONTROLNET_MODEL if self.config.USE_SDXL_CONTROLNET else None
                     }
                 }
                 
@@ -818,14 +966,12 @@ class EnhancedPipeline:
                 print(f"\n{'='*80}")
                 print("✓ PROCESSING COMPLETE!")
                 print("=" * 80)
-                print(f"Original Size: {original_image.size}")
-                print(f"Upscaled Size: {upscaled_image.size}")
-                print(f"\nCaption: {caption}")
-                print(f"\nDetections: {detection_results['summary']}")
-                print(f"\nSAM Locations: {location_results.get('spatial_description', 'N/A')}")
-                print(f"\n--- FULL COMBINED PROMPT (STAGE 3) ---")
-                print(combined_prompt)
-                print(f"\n--- END OF COMBINED PROMPT ---")
+                print(f"\n--- GENERATED IMAGE ---")
+                print(f"Size: {generated_image.size}")
+                print(f"Path: {output_path}")
+                
+                print(f"\n--- GENERATED IMAGE DESCRIPTION ---")
+                print(output_caption)
                 print("=" * 80)
                 return True
             return False
