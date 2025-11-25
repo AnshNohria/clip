@@ -24,7 +24,7 @@ segment-anything
 # Image processing
 Pillow
 opencv-python-headless
-
+sentencepiece
 # Utilities
 tqdm
 numpy
