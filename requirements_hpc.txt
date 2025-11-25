@@ -7,13 +7,13 @@ torch==2.6.0+cu124
 torchvision==0.21.0+cu124
 
 # Diffusion models
-diffusers==0.31.0
-accelerate==0.34.2
-safetensors==0.4.5
+diffusers>=0.30.0
+accelerate>=0.34.0
+safetensors>=0.4.0
 
 # Transformers for Qwen2-VL, Phi-3.5, etc.
-transformers==4.46.3
-tokenizers==0.20.3
+transformers>=4.46.0
+tokenizers>=0.20.0
 qwen-vl-utils==0.0.8
 
 # Grounding DINO dependencies
