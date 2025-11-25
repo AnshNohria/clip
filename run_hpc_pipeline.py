@@ -462,36 +462,17 @@ class PreciseLocalizer:
 
 class SmartPromptCombiner:
     """
-    Uses Phi-3.5-mini to intelligently combine caption and detection results
-    into an optimal prompt for Text2Earth
+    Template-based prompt combiner for aerial imagery
+    Combines Qwen2-VL captions with Grounding DINO detections and SAM spatial positions
+    More reliable than LLM-based combination for structured data
     """
     
     def __init__(self, config):
         self.config = config
-        print("\n[5/6] Loading Phi-3.5-mini...")
-        
-        try:
-            from transformers import AutoTokenizer, AutoModelForCausalLM
-            
-            self.tokenizer = AutoTokenizer.from_pretrained(
-                config.PHI_MODEL,
-                cache_dir=str(config.CACHE_DIR)
-            )
-            
-            self.model = AutoModelForCausalLM.from_pretrained(
-                config.PHI_MODEL,
-                cache_dir=str(config.CACHE_DIR),
-                torch_dtype=torch.float16,
-                device_map="auto",
-                low_cpu_mem_usage=True,
-                trust_remote_code=True
-            )
-            
-            print("✓ Phi-3.5-mini loaded")
-            print(f"  ✓ GPU Memory: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
-        except Exception as e:
-            print(f"✗ Error: {e}")
-            raise
+        print("\n[5/6] Initializing Template-based Prompt Combiner...")
+        print("✓ Using direct template-based combination (no LLM needed)")
+        print("  ✓ Ensures ALL detection data (counts + spatial positions) is included")
+    
     
     def combine_prompt(self, caption, detection_results):
         """
@@ -515,78 +496,30 @@ class SmartPromptCombiner:
             # Include: Qwen2-VL caption + DINO detections + SAM spatial locations
             enhanced_summary = detection_results.get('summary', '')
             
-            # Build detailed prompt for Phi-3.5 with ALL context - MUST include counts and positions
-            prompt = f"""You are an expert at creating detailed aerial image generation prompts. Combine ALL the following information:
-
-Scene: {caption}
-Objects: {counts_text} (Total: {total})
-Positions: {enhanced_summary}
-
-Write ONE comprehensive aerial view prompt that MUST include:
-1. The scene type (e.g., "urban area", "residential zone", "industrial complex")
-2. EVERY detected object with its exact count (e.g., "47 buildings", "23 houses")
-3. Spatial positions of objects (e.g., "concentrated in top-left", "scattered across center-right")
-4. Overall layout and composition
-
-Detailed aerial image prompt:"""
+            # Extract spatial layout from enhanced_summary if available
+            spatial_info = ""
+            if "Spatial layout:" in enhanced_summary:
+                spatial_info = enhanced_summary.split("Spatial layout:")[-1].strip()
             
-            inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
+            # Build DIRECT template-based combination (more reliable than LLM for structured data)
+            # This ensures ALL detection data is included in the final prompt
+            combined = f"Aerial view of {caption.lower()}"
             
-            # Generate with timeout protection
-            print("    Combining with Phi-3.5...")
-            print(f"    ℹ Input length: {inputs['input_ids'].shape[1]} tokens")
+            # Add object counts explicitly
+            if counts_text:
+                combined += f" featuring {counts_text}"
             
-            with torch.no_grad():
-                outputs = self.model.generate(
-                    **inputs,
-                    max_new_tokens=300,
-                    do_sample=False,
-                    pad_token_id=self.tokenizer.eos_token_id,
-                    eos_token_id=self.tokenizer.eos_token_id,
-                    use_cache=False,
-                    num_beams=1
-                )
+            # Add spatial distribution
+            if spatial_info:
+                combined += f". Spatial distribution: {spatial_info}"
+            elif enhanced_summary and not spatial_info:
+                # Use full summary if no spatial layout extracted
+                combined += f". {enhanced_summary}"
             
-            print("    ✓ Generation complete")
+            # Add quality enhancers
+            combined += ". High quality aerial photography, detailed, sharp focus."
             
-            # Decode only the new tokens (skip the input prompt)
-            input_length = inputs['input_ids'].shape[1]
-            generated_tokens = outputs[0][input_length:]
-            generated_text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True).strip()
-            
-            # Clean up the output
-            combined = generated_text
-            
-            print(f"    ℹ Raw output: {combined[:100]}...")
-            
-            # Validate output quality - ensure it uses all information
-            if not combined or len(combined) < 15:
-                # Fallback: Detailed manual combination with ALL information
-                combined = f"Aerial view of {caption.lower()}"
-                if counts_text:
-                    combined += f" with {counts_text}"
-                if enhanced_summary:
-                    # Extract spatial info
-                    if "Spatial layout:" in enhanced_summary:
-                        spatial_part = enhanced_summary.split("Spatial layout:")[-1].strip()
-                    else:
-                        spatial_part = enhanced_summary
-                    
-                    if spatial_part:
-                        combined += f". Objects are positioned: {spatial_part}"
-                
-                combined += ". High quality aerial photography, detailed, sharp focus."
-                print(f"    ⚠ Using enhanced fallback prompt ({len(combined.split())} words)")
-            
-            # Ensure proper formatting
-            if not combined.lower().startswith("aerial"):
-                combined = f"Aerial view: {combined}"
-            
-            # Clean up any artifacts
-            combined = combined.replace("  ", " ").strip()
-            
-            # NO TRUNCATION - let SD3.5's 512-token limit handle it
-            print(f"    ✓ Combined prompt ({len(combined.split())} words): {combined}")
+            print(f"    ✓ Template-based combination ({len(combined.split())} words): {combined}")
             return combined
             
         except Exception as e:
