@@ -69,7 +69,8 @@ class Config:
     UPSCALE_FACTOR = 4  # NEW: 4x upscaling
     OUTPUT_IMAGE_SIZE = 1024  # SD3.5 supports 1024x1024
     NUM_INFERENCE_STEPS = 28  # Optimized for SD3.5 Medium
-    GUIDANCE_SCALE = 7.0  # Higher guidance = more accurate to prompt (SD3.5 range: 3.0-9.0)
+    GUIDANCE_SCALE = 8.5  # Higher = more accurate to prompt (SD3.5 range: 3.0-10.0)
+    # Increase this to 9.0-10.0 for even more prompt adherence (may reduce creativity)
     MAX_FINAL_PROMPT_WORDS = 300  # Increased for detailed SD3.5 prompts
     
     # Detection classes - expanded for better aerial imagery detection
@@ -628,34 +629,33 @@ class SD35ImageGenerator:
         The CLIP warnings are EXPECTED and can be ignored. The T5-XXL encoder
         is what actually processes your full prompt for image generation.
         
-        Note: SD3.5 may still generate more/fewer objects than specified.
-        This is normal diffusion model behavior. To improve:
-        - Increased guidance_scale to 7.0 (done)
-        - Use detailed prompts (done)
-        - Future: ControlNet for exact spatial control
+        LIMITATION: Text-to-image models CANNOT guarantee exact object counts or
+        precise spatial placement. This is a fundamental limitation of diffusion models.
+        They interpret "29 houses" as "many houses" semantically.
+        
+        For exact counts/positions, you would need:
+        - ControlNet (layout-conditioned generation)
+        - Fine-tuned model on aerial imagery with count annotations
+        - Image-to-image pipeline (not available in SD3.5 yet)
         """
         try:
             print(f"  Generating image with Stable Diffusion 3.5 Medium...")
             print(f"  Prompt ({len(prompt)} chars): {prompt[:150]}...")
             print(f"  Resolution: {self.config.OUTPUT_IMAGE_SIZE}x{self.config.OUTPUT_IMAGE_SIZE}")
-            print(f"  Steps: {self.config.NUM_INFERENCE_STEPS} (optimized for SD3.5)")
-            
-            # IMPORTANT: SD3.5 uses T5-XXL as PRIMARY encoder (512 tokens)
-            # CLIP encoders will show warnings but are SECONDARY
-            # The T5 embedding is what matters for long prompts!
+            print(f"  Steps: {self.config.NUM_INFERENCE_STEPS}, Guidance: {self.config.GUIDANCE_SCALE}")
             
             # Negative prompt for better quality
-            negative_prompt = "blurry, low quality, distorted, deformed, ugly, bad anatomy, watermark, text"
+            negative_prompt = "blurry, low quality, distorted, deformed, ugly, bad anatomy, watermark, text, extra objects, wrong count"
             
             # Generate with FULL 512-token support via T5 encoder
             image = self.pipe(
-                prompt=prompt,  # Full detailed prompt (T5 handles it)
+                prompt=prompt,
                 negative_prompt=negative_prompt,
                 height=self.config.OUTPUT_IMAGE_SIZE,
                 width=self.config.OUTPUT_IMAGE_SIZE,
                 num_inference_steps=self.config.NUM_INFERENCE_STEPS,
-                guidance_scale=self.config.GUIDANCE_SCALE,
-                max_sequence_length=512  # T5-XXL encoder supports 512 tokens
+                guidance_scale=self.config.GUIDANCE_SCALE,  # 8.5 for better adherence
+                max_sequence_length=512
             ).images[0]
             
             image.save(output_path)
