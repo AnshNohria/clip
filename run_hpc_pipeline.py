@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
-COMPLETE PIPELINE: Qwen2-VL → Grounding DINO → SAM → Template Combiner → SD3.5
+COMPLETE PIPELINE: Qwen2-VL → Grounding DINO → SAM → Template Combiner → SDXL+ControlNet
 Optimized for GPU server execution
+
+Output: Generated image + detailed description
 """
 
 import os
@@ -50,7 +52,6 @@ class Config:
     SAM_MODEL = "facebook/sam-vit-base"  # Precise localization
     QWEN2VL_MODEL = "Qwen/Qwen2-VL-2B-Instruct"
     GROUNDING_DINO_MODEL = "IDEA-Research/grounding-dino-base"
-    USE_SDXL_CONTROLNET = True
     SDXL_MODEL = "stabilityai/stable-diffusion-xl-base-1.0"
     CONTROLNET_MODEL = "diffusers/controlnet-canny-sdxl-1.0"  # Canny edge control
     
@@ -702,102 +703,6 @@ class SDXLControlNetGenerator:
             import traceback
             traceback.print_exc()
             return False
-    """
-    Stable Diffusion 3.5 Medium generator for high-quality aerial image generation
-    """
-    
-    def __init__(self, config):
-        self.config = config
-        print("\n[6/6] Loading Stable Diffusion 3.5 Medium...")
-        
-        try:
-            from diffusers import StableDiffusion3Pipeline
-            import gc
-            
-            # CRITICAL: Clear GPU memory before loading SD3.5
-            print("  ℹ Clearing GPU memory for SD3.5...")
-            torch.cuda.empty_cache()
-            gc.collect()
-            
-            # Load with fp16 variant for better compatibility
-            self.pipe = StableDiffusion3Pipeline.from_pretrained(
-                config.SD35_MODEL,
-                cache_dir=str(config.CACHE_DIR),
-                torch_dtype=torch.float16,
-                variant="fp16"
-            ).to(device)
-            
-            # IMPORTANT: SD3.5 uses 3 text encoders:
-            # - text_encoder (CLIP-L): 77 tokens max
-            # - text_encoder_2 (CLIP-G): 77 tokens max  
-            # - text_encoder_3 (T5-XXL): 512 tokens max
-            # The T5 encoder is the PRIMARY one for long prompts
-            
-            print("  ℹ NOTE: You will see CLIP truncation warnings below - these are SAFE TO IGNORE")
-            print("  ℹ SD3.5's T5-XXL encoder (512 tokens) is processing your FULL prompt")
-            
-            # Enable attention slicing for memory efficiency on GPU
-            print("  ℹ Enabling attention slicing for GPU memory efficiency...")
-            self.pipe.enable_attention_slicing()
-            
-            print("✓ Stable Diffusion 3.5 Medium loaded")
-            print(f"  ✓ GPU Memory: {torch.cuda.memory_allocated()/1024**3:.2f} GB")
-            print("  ✓ Full GPU mode with attention slicing")
-            
-        except Exception as e:
-            print(f"✗ Error loading SD3.5: {e}")
-            raise
-    
-    def generate_image(self, prompt, output_path):
-        """
-        Generate high-quality aerial image using SD3.5 Medium
-        
-        IMPORTANT: SD3.5 uses 3 text encoders in parallel:
-        1. CLIP-L (77 tokens) - will truncate and show warnings (IGNORE these)
-        2. CLIP-G (77 tokens) - will truncate and show warnings (IGNORE these)  
-        3. T5-XXL (512 tokens) - PRIMARY encoder, handles full prompt
-        
-        The CLIP warnings are EXPECTED and can be ignored. The T5-XXL encoder
-        is what actually processes your full prompt for image generation.
-        
-        LIMITATION: Text-to-image models CANNOT guarantee exact object counts or
-        precise spatial placement. This is a fundamental limitation of diffusion models.
-        They interpret "29 houses" as "many houses" semantically.
-        
-        For exact counts/positions, you would need:
-        - ControlNet (layout-conditioned generation)
-        - Fine-tuned model on aerial imagery with count annotations
-        - Image-to-image pipeline (not available in SD3.5 yet)
-        """
-        try:
-            print(f"  Generating image with Stable Diffusion 3.5 Medium...")
-            print(f"  Prompt ({len(prompt)} chars): {prompt[:150]}...")
-            print(f"  Resolution: {self.config.OUTPUT_IMAGE_SIZE}x{self.config.OUTPUT_IMAGE_SIZE}")
-            print(f"  Steps: {self.config.NUM_INFERENCE_STEPS}, Guidance: {self.config.GUIDANCE_SCALE}")
-            
-            # Negative prompt for better quality
-            negative_prompt = "blurry, low quality, distorted, deformed, ugly, bad anatomy, watermark, text, extra objects, wrong count"
-            
-            # Generate with FULL 512-token support via T5 encoder
-            image = self.pipe(
-                prompt=prompt,
-                negative_prompt=negative_prompt,
-                height=self.config.OUTPUT_IMAGE_SIZE,
-                width=self.config.OUTPUT_IMAGE_SIZE,
-                num_inference_steps=self.config.NUM_INFERENCE_STEPS,
-                guidance_scale=self.config.GUIDANCE_SCALE,  # 8.5 for better adherence
-                max_sequence_length=512
-            ).images[0]
-            
-            image.save(output_path)
-            print(f"  ✓ Saved: {output_path.name}")
-            return True
-            
-        except Exception as e:
-            print(f"  ✗ Error: {e}")
-            import traceback
-            traceback.print_exc()
-            return False
 
 # ============================================================================
 # COMPLETE PIPELINE
@@ -823,13 +728,8 @@ class EnhancedPipeline:
         # Stage 3: Combiner
         self.combiner = SmartPromptCombiner(self.config)
         
-        # Stage 4: Image Generator (SDXL + ControlNet OR SD3.5)
-        if self.config.USE_SDXL_CONTROLNET:
-            print("\n  ℹ Using SDXL + ControlNet for precise spatial control")
-            self.generator = SDXLControlNetGenerator(self.config)
-        else:
-            print("\n  ℹ Using SD3.5 Medium (text-only, no spatial control)")
-            self.generator = SD35ImageGenerator(self.config)
+        # Stage 4: Image Generator (SDXL + ControlNet)
+        self.generator = SDXLControlNetGenerator(self.config)
         
         print("\n" + "=" * 80)
         print("✓ Enhanced 6-Stage Pipeline Ready!")
@@ -838,12 +738,8 @@ class EnhancedPipeline:
         print("  3. Grounding DINO Detector")
         print("  4. SAM Precise Localizer")
         print("  5. Template-based Combiner")
-        if self.config.USE_SDXL_CONTROLNET:
-            print("  6. SDXL + ControlNet (1024x1024) ← PRECISE SPATIAL CONTROL")
-            print("  7. Qwen2-VL-2B Captioner (output image description)")
-        else:
-            print("  6. Stable Diffusion 3.5 Medium (1024x1024)")
-            print("  7. Qwen2-VL-2B Captioner (output image description)")
+        print("  6. SDXL + ControlNet (1024x1024)")
+        print("  7. Qwen2-VL-2B Captioner (output image description)")
         print("=" * 80)
     
     def process_image(self, image_path, image_name):
@@ -919,19 +815,15 @@ class EnhancedPipeline:
                 print(f"  ✓ GPU memory status: {allocated:.2f}GB allocated, {reserved:.2f}GB reserved")
             
             # Stage 4: Image Generation
-            generator_name = "SDXL + ControlNet" if self.config.USE_SDXL_CONTROLNET else "SD3.5 Medium"
-            print(f"\n[Stage 4/5] Generating image with {generator_name}...")
+            print(f"\n[Stage 4/5] Generating image with SDXL + ControlNet...")
             output_path = self.config.OUTPUT_DIR / "images" / f"{image_name}_generated.png"
             
             # Pass upscaled image as control for ControlNet
-            if self.config.USE_SDXL_CONTROLNET:
-                success = self.generator.generate_image(
-                    combined_prompt, 
-                    output_path,
-                    control_image=upscaled_image  # Use upscaled image for structure
-                )
-            else:
-                success = self.generator.generate_image(combined_prompt, output_path)
+            success = self.generator.generate_image(
+                combined_prompt, 
+                output_path,
+                control_image=upscaled_image  # Use upscaled image for structure
+            )
             
             if success:
                 # Stage 5: Caption the generated image
@@ -954,8 +846,8 @@ class EnhancedPipeline:
                         "detection": self.config.GROUNDING_DINO_MODEL,
                         "localizer": self.config.SAM_MODEL,
                         "combiner": "Template-based",
-                        "generation": self.config.SDXL_MODEL if self.config.USE_SDXL_CONTROLNET else "SD3.5 Medium",
-                        "controlnet": self.config.CONTROLNET_MODEL if self.config.USE_SDXL_CONTROLNET else None
+                        "generation": self.config.SDXL_MODEL,
+                        "controlnet": self.config.CONTROLNET_MODEL
                     }
                 }
                 
