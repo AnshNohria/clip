@@ -515,16 +515,20 @@ class SmartPromptCombiner:
             # Include: Qwen2-VL caption + DINO detections + SAM spatial locations
             enhanced_summary = detection_results.get('summary', '')
             
-            # Build detailed prompt for Phi-3.5 with all context
-            prompt = f"""Combine the following aerial image information into ONE detailed prompt for image generation:
+            # Build detailed prompt for Phi-3.5 with ALL context - MUST include counts and positions
+            prompt = f"""You are an expert at creating detailed aerial image generation prompts. Combine ALL the following information:
 
-Scene Description: {caption}
+Scene: {caption}
+Objects: {counts_text} (Total: {total})
+Positions: {enhanced_summary}
 
-Detected Objects: {counts_text} (Total: {total})
+Write ONE comprehensive aerial view prompt that MUST include:
+1. The scene type (e.g., "urban area", "residential zone", "industrial complex")
+2. EVERY detected object with its exact count (e.g., "47 buildings", "23 houses")
+3. Spatial positions of objects (e.g., "concentrated in top-left", "scattered across center-right")
+4. Overall layout and composition
 
-Spatial Layout: {enhanced_summary}
-
-Create a natural, detailed aerial view prompt that explicitly mentions the scene type, lists the detected objects with their counts, and describes their spatial positions:"""
+Detailed aerial image prompt:"""
             
             inputs = self.tokenizer(prompt, return_tensors="pt").to(self.model.device)
             
@@ -557,15 +561,22 @@ Create a natural, detailed aerial view prompt that explicitly mentions the scene
             
             # Validate output quality - ensure it uses all information
             if not combined or len(combined) < 15:
-                # Fallback: Manual combination ensuring all info is included
-                combined = f"Aerial view: {caption}"
+                # Fallback: Detailed manual combination with ALL information
+                combined = f"Aerial view of {caption.lower()}"
                 if counts_text:
-                    combined += f" featuring {counts_text}"
-                if enhanced_summary and "Spatial layout:" in enhanced_summary:
-                    spatial_info = enhanced_summary.split("Spatial layout:")[-1].strip()
-                    if spatial_info:
-                        combined += f", {spatial_info}"
-                print(f"    ⚠ Using enhanced fallback prompt")
+                    combined += f" with {counts_text}"
+                if enhanced_summary:
+                    # Extract spatial info
+                    if "Spatial layout:" in enhanced_summary:
+                        spatial_part = enhanced_summary.split("Spatial layout:")[-1].strip()
+                    else:
+                        spatial_part = enhanced_summary
+                    
+                    if spatial_part:
+                        combined += f". Objects are positioned: {spatial_part}"
+                
+                combined += ". High quality aerial photography, detailed, sharp focus."
+                print(f"    ⚠ Using enhanced fallback prompt ({len(combined.split())} words)")
             
             # Ensure proper formatting
             if not combined.lower().startswith("aerial"):
@@ -574,12 +585,8 @@ Create a natural, detailed aerial view prompt that explicitly mentions the scene
             # Clean up any artifacts
             combined = combined.replace("  ", " ").strip()
             
-            # Truncate to word limit while preserving complete information
-            words = combined.split()
-            if len(words) > self.config.MAX_FINAL_PROMPT_WORDS:
-                combined = " ".join(words[:self.config.MAX_FINAL_PROMPT_WORDS])
-            
-            print(f"    ✓ Combined prompt: {combined}")
+            # NO TRUNCATION - let SD3.5's 512-token limit handle it
+            print(f"    ✓ Combined prompt ({len(combined.split())} words): {combined}")
             return combined
             
         except Exception as e:
