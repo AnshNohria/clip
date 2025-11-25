@@ -271,12 +271,26 @@ class GroundingDINODetector:
             with torch.no_grad():
                 outputs = self.model(**inputs)
             
+            # Post-process detections (thresholds are now handled internally by the model)
             results = self.processor.post_process_grounded_object_detection(
-                outputs, inputs.input_ids, 
-                box_threshold=0.25,
-                text_threshold=0.2,
+                outputs,
+                inputs.input_ids,
                 target_sizes=[image.size[::-1]]
             )[0]
+            
+            # Filter results by confidence threshold (manual filtering after post-processing)
+            box_threshold = 0.25
+            if 'scores' in results:
+                mask = results['scores'] >= box_threshold
+                results = {
+                    'boxes': results['boxes'][mask],
+                    'scores': results['scores'][mask],
+                    'labels': [label for i, label in enumerate(results['labels']) if mask[i]]
+                }
+            
+            # Ensure results has proper structure even if empty
+            if 'boxes' not in results or len(results['boxes']) == 0:
+                results = {'boxes': [], 'scores': [], 'labels': []}
             
             # Count objects
             counts = {}
@@ -292,6 +306,7 @@ class GroundingDINODetector:
                 print(f"    ✓ Detected: {summary} (total: {total})")
             else:
                 summary = ""
+                print(f"    ℹ No objects detected above threshold {box_threshold}")
             
             return {
                 "counts": counts,
