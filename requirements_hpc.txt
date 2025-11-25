@@ -1,39 +1,37 @@
 # HPC Pipeline Requirements
-# SkyEyeGPT → Grounding DINO → Text2Earth
+# Enhanced RS Image Processing Pipeline
 
-# Core PyTorch (CUDA version for GPU servers)
---index-url https://download.pytorch.org/whl/cu124
-torch==2.6.0+cu124
-torchvision==0.21.0+cu124
+# Core PyTorch (install separately first with CUDA)
+# pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 
 # Diffusion models
-diffusers>=0.30.0
-accelerate>=0.34.0
-safetensors>=0.4.0
+diffusers
+accelerate
+safetensors
 
 # Transformers for Qwen2-VL, Phi-3.5, etc.
-transformers>=4.46.0
-tokenizers>=0.20.0
+transformers
+tokenizers
 qwen-vl-utils==0.0.8
 
 # Grounding DINO dependencies
-supervision==0.24.0
-groundingdino-py==0.4.0
+supervision
+groundingdino-py
 
 # SAM (Segment Anything Model)
-segment-anything==1.0
+segment-anything
 
 # Image processing
-Pillow==11.0.0
-opencv-python-headless==4.10.0.84
+Pillow
+opencv-python-headless
 
 # Utilities
-tqdm==4.67.1
-numpy==1.26.4
-scipy==1.14.1
+tqdm
+numpy
+scipy
 
 # HuggingFace Hub
-huggingface-hub==0.26.2
+huggingface-hub
 
 # Development tools
-ipython==8.29.0
+ipython
