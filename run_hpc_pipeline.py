@@ -59,7 +59,7 @@ class Config:
     # Models
     UPSCALER_MODEL = "PyTorch-Bicubic"  # High-quality bicubic upscaling
     SAM_MODEL = "facebook/sam-vit-base"  # NEW: Precise localization
-    QWEN2VL_MODEL = "Qwen/Qwen2-VL-2B-Instruct"
+    QWEN2VL_MODEL = "Qwen/Qwen2-VL-7B-Instruct"
     GROUNDING_DINO_MODEL = "IDEA-Research/grounding-dino-base"
     PHI_MODEL = "microsoft/Phi-3.5-mini-instruct"  # Smart prompt combiner
     SD35_MODEL = "stabilityai/stable-diffusion-3.5-medium"  # SD3.5 Medium
@@ -157,7 +157,7 @@ class RealESRGANUpscaler:
 class Qwen2VLCaptioner:
     def __init__(self, config):
         self.config = config
-        print("\n[2/6] Loading Qwen2-VL-2B...")
+        print(f"\n[2/6] Loading {config.QWEN2VL_MODEL}...")
         
         try:
             from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
@@ -307,7 +307,8 @@ class GroundingDINODetector:
             # Count objects
             counts = {}
             for label in results['labels']:
-                counts[label] = counts.get(label, 0) + 1
+                label_str = str(label)
+                counts[label_str] = counts.get(label_str, 0) + 1
             
             total = sum(counts.values())
             
@@ -385,6 +386,7 @@ class PreciseLocalizer:
             img_width, img_height = image.size
             
             for idx, (box, label) in enumerate(zip(boxes, labels)):
+                label_str = str(label)
                 # Process with SAM for precise segmentation
                 inputs = self.processor(
                     img_array,
@@ -436,7 +438,7 @@ class PreciseLocalizer:
                     size_desc = "large" if relative_size > 0.15 else "medium" if relative_size > 0.05 else "small"
                     
                     locations.append({
-                        "object": label,
+                        "object": label_str,
                         "position": position,
                         "center": (center_x, center_y),
                         "area": int(area),
@@ -444,7 +446,7 @@ class PreciseLocalizer:
                         "size_description": size_desc
                     })
                     
-                    print(f"    ✓ {label}: {position} ({size_desc})")
+                    print(f"    ✓ {label_str}: {position} ({size_desc})")
             
             # Create spatial description
             if locations:
@@ -654,8 +656,7 @@ class SD35ImageGenerator:
                 height=self.config.OUTPUT_IMAGE_SIZE,
                 width=self.config.OUTPUT_IMAGE_SIZE,
                 num_inference_steps=self.config.NUM_INFERENCE_STEPS,
-                guidance_scale=self.config.GUIDANCE_SCALE,  # 8.5 for better adherence
-                max_sequence_length=512
+                guidance_scale=self.config.GUIDANCE_SCALE  # 8.5 for better adherence
             ).images[0]
             
             image.save(output_path)
@@ -698,7 +699,7 @@ class EnhancedPipeline:
         print("\n" + "=" * 80)
         print("✓ Enhanced 5-Stage Pipeline Ready!")
         print("  1. Real-ESRGAN Upscaler (4x)")
-        print("  2. Qwen2-VL-2B Captioner")
+        print("  2. Qwen2-VL Captioner")
         print("  3. Grounding DINO Detector")
         print("  4. SAM Precise Localizer")
         print("  5. Phi-3.5-mini Combiner")
@@ -868,7 +869,7 @@ def main():
     print("=" * 80)
     print("\nPipeline Features:")
     print("  ✓ PyTorch Bicubic 4x upscaling")
-    print("  ✓ Qwen2-VL-2B for RS image captioning")
+    print("  ✓ Qwen2-VL for RS image captioning")
     print("  ✓ Grounding DINO for zero-shot object detection")
     print("  ✓ SAM for precise 9-grid object localization")
     print("  ✓ Phi-3.5-mini for intelligent prompt combination")

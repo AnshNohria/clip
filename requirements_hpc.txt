@@ -1,5 +1,5 @@
 # HPC Pipeline Requirements
-# Enhanced RS Image Processing Pipeline
+# Enhanced RS Image Processing Pipeline + Stage 1/2 Training
 
 # Core PyTorch (install separately first with CUDA)
 # pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
@@ -25,6 +25,14 @@ segment-anything
 Pillow
 opencv-python-headless
 sentencepiece
+
+# CLIP models (for quality filtering and fine-tuning)
+open_clip_torch>=2.20.0
+clip @ git+https://github.com/openai/CLIP.git  # Optional fallback
+
+# HuggingFace Hub (for RemoteCLIP download)
+huggingface_hub
+
 # Utilities
 tqdm
 numpy
