@@ -42,6 +42,7 @@ try:
     HAS_TORCH = True
     HAS_CUDA = torch.cuda.is_available()
 except ImportError:
+    torch = None  # type: ignore[assignment]
     HAS_TORCH = False
     HAS_CUDA = False
 
@@ -401,7 +402,7 @@ class ImageAugmentor:
                 "brightness", "contrast", "crop", "color_jitter"
             ])
         
-        params = {"type": aug_type}
+        params: Dict[str, Any] = {"type": aug_type}
         
         if aug_type == "horizontal_flip":
             result = ImageOps.mirror(image)
@@ -486,7 +487,7 @@ class ImageAugmentor:
             cropped = image.crop((x1, y1, x2, y2))
             cropped = cropped.resize(self.output_size, Image.Resampling.LANCZOS)
             
-            crop_info = {
+            crop_info: Dict[str, Any] = {
                 'type': 'zoom_crop',
                 'source_bbox': (x1, y1, x2, y2),
                 'region_position': region.get('position', 'unknown'),
@@ -507,7 +508,7 @@ class Stage1DatasetBuilder:
     Main class for building the Stage 1 training corpus.
     """
     
-    def __init__(self, config: DatasetConfig = None):
+    def __init__(self, config: Optional[DatasetConfig] = None):
         self.config = config or DatasetConfig()
         self.enricher = CaptionEnricher()
         self.augmentor = ImageAugmentor()
@@ -576,7 +577,7 @@ class Stage1DatasetBuilder:
                 messages, tokenize=False, add_generation_prompt=True
             )
             
-            image_inputs, video_inputs = self.process_vision_info(messages)
+            image_inputs, video_inputs, _ = self.process_vision_info(messages)
             inputs = self.vlm_processor(
                 text=[text], images=image_inputs, videos=video_inputs,
                 padding=True, return_tensors="pt"

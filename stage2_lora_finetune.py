@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """
 STAGE 2: Synthetic-Heavy Pretraining / Fine-Tuning
 
@@ -35,6 +36,15 @@ from typing import List, Dict, Optional, Tuple, Any, Union
 from collections import Counter
 import warnings
 warnings.filterwarnings('ignore')
+
+# Predeclare optional deps for type-checkers
+torch: Any = None
+nn: Any = None
+F: Any = None
+Dataset: Any = None
+DataLoader: Any = None
+Image: Any = None
+np: Any = None
 
 # Check for dependencies
 try:
@@ -149,7 +159,7 @@ class LoRALayer(nn.Module):
         nn.init.kaiming_uniform_(self.lora_A, a=math.sqrt(5))
         nn.init.zeros_(self.lora_B)
     
-    def forward(self, x: torch.Tensor, original_output: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: Any, original_output: Any) -> Any:
         """
         Apply LoRA adaptation.
         
@@ -176,7 +186,7 @@ class LoRALinear(nn.Module):
     
     def __init__(
         self,
-        original_layer: nn.Linear,
+        original_layer: Any,
         rank: int = 8,
         alpha: float = 16.0,
         dropout: float = 0.1
@@ -196,18 +206,18 @@ class LoRALinear(nn.Module):
         for param in self.original_layer.parameters():
             param.requires_grad = False
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: Any) -> Any:
         original_out = self.original_layer(x)
         return self.lora(x, original_out)
 
 
 def apply_lora_to_model(
-    model: nn.Module,
+    model: Any,
     target_modules: List[str],
     rank: int = 8,
     alpha: float = 16.0,
     dropout: float = 0.1
-) -> nn.Module:
+) -> Any:
     """
     Apply LoRA to specified modules in a model.
     
@@ -289,7 +299,7 @@ class ProjectionHead(nn.Module):
         
         self.projection = nn.Sequential(*layers)
     
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: Any) -> Any:
         return F.normalize(self.projection(x), dim=-1)
 
 
@@ -382,6 +392,8 @@ class Stage2Dataset(Dataset):
             pair = self.pairs[idx]
         
         # Load image
+        if Image is None:
+            raise RuntimeError("PIL is required to load images for Stage 2")
         image_path = self.dataset_dir / pair['image_path']
         try:
             image = Image.open(image_path).convert('RGB')
@@ -438,10 +450,10 @@ class CLIPContrastiveLoss(nn.Module):
     
     def forward(
         self,
-        image_features: torch.Tensor,
-        text_features: torch.Tensor,
-        sample_weights: Optional[torch.Tensor] = None
-    ) -> Tuple[torch.Tensor, Dict]:
+        image_features: Any,
+        text_features: Any,
+        sample_weights: Optional[Any] = None
+    ) -> Tuple[Any, Dict]:
         """
         Compute CLIP loss.
         
@@ -514,10 +526,10 @@ class FineGrainedAlignmentLoss(nn.Module):
     
     def forward(
         self,
-        word_features: torch.Tensor,  # (B, num_words, D)
-        image_features: torch.Tensor,  # (B, num_patches, D) or (B, D) for CLS
-        region_masks: Optional[torch.Tensor] = None  # (B, num_regions)
-    ) -> Tuple[torch.Tensor, Dict]:
+        word_features: Any,
+        image_features: Any,
+        region_masks: Optional[Any] = None
+    ) -> Tuple[Any, Dict]:
         """
         Compute fine-grained alignment loss.
         
@@ -570,15 +582,17 @@ class Stage2Trainer:
         self.device = DEVICE
         
         # Will be initialized in setup()
-        self.model = None
-        self.tokenizer = None
-        self.preprocess = None
-        self.projection_image = None
-        self.projection_text = None
-        self.optimizer = None
-        self.scheduler = None
-        self.clip_loss = None
-        self.fine_grained_loss = None
+        self.model: Optional[Any] = None
+        self.tokenizer: Optional[Any] = None
+        self.preprocess: Optional[Any] = None
+        self.projection_image: Optional[Any] = None
+        self.projection_text: Optional[Any] = None
+        self.optimizer: Optional[Any] = None
+        self.scheduler: Optional[Any] = None
+        self.clip_loss: Optional[Any] = None
+        self.fine_grained_loss: Optional[Any] = None
+        self.model_type: Optional[str] = None
+        self.class_weights: Dict[str, float] = {}
         
         # Training state
         self.global_step = 0
@@ -664,15 +678,16 @@ class Stage2Trainer:
             # Try OpenAI CLIP
             try:
                 import clip
-                model, preprocess = clip.load("ViT-B/32", device=self.device)
+                model, preprocess = clip.load("ViT-B/32", device=self.device)  # type: ignore[attr-defined]
                 self.model = model
                 self.preprocess = preprocess
-                self.tokenizer = clip.tokenize
+                self.tokenizer = clip.tokenize  # type: ignore[attr-defined]
                 self.model_type = "OpenAI-CLIP"
                 print("  ✓ Loaded OpenAI CLIP")
             except ImportError:
                 raise RuntimeError("No CLIP implementation available. Install open_clip or clip.")
         
+        assert self.model is not None, "Model failed to load"
         # Freeze backbone
         for param in self.model.parameters():
             param.requires_grad = False
@@ -682,6 +697,7 @@ class Stage2Trainer:
     
     def _apply_lora(self):
         """Apply LoRA to the model"""
+        assert self.model is not None, "Model must be loaded before applying LoRA"
         # Apply to visual encoder
         if hasattr(self.model, 'visual'):
             self.model.visual = apply_lora_to_model(
@@ -710,6 +726,7 @@ class Stage2Trainer:
     
     def _create_projection_heads(self):
         """Create trainable projection heads"""
+        assert HAS_TORCH, "PyTorch required for projection heads"
         self.projection_image = ProjectionHead(
             input_dim=self.config.EMBED_DIM,
             hidden_dim=self.config.EMBED_DIM,
@@ -724,12 +741,15 @@ class Stage2Trainer:
             num_layers=2
         ).to(self.device)
         
+        assert self.projection_image is not None and self.projection_text is not None
         proj_params = sum(p.numel() for p in self.projection_image.parameters())
         proj_params += sum(p.numel() for p in self.projection_text.parameters())
         print(f"  Projection head params: {proj_params:,}")
     
     def _setup_optimizer(self):
         """Setup optimizer and learning rate scheduler"""
+        assert self.model is not None, "Model must be initialized before optimizer"
+        assert self.projection_image is not None and self.projection_text is not None, "Projection heads must be initialized"
         # Collect trainable parameters
         params = []
         
@@ -763,7 +783,9 @@ class Stage2Trainer:
     
     def _setup_losses(self):
         """Setup loss functions"""
+        assert HAS_TORCH, "PyTorch required for losses"
         self.clip_loss = CLIPContrastiveLoss(temperature=self.config.TEMPERATURE)
+        assert self.clip_loss is not None
         self.clip_loss.to(self.device)
         
         if self.config.USE_FINE_GRAINED_LOSS:
@@ -775,8 +797,9 @@ class Stage2Trainer:
             self.fine_grained_loss = None
             print("  ✓ Fine-grained alignment loss DISABLED")
     
-    def create_dataloader(self) -> DataLoader:
+    def create_dataloader(self) -> Any:
         """Create training data loader"""
+        assert self.preprocess is not None and self.tokenizer is not None, "Preprocess and tokenizer must be initialized"
         dataset = Stage2Dataset(
             dataset_path=self.config.FILTERED_DATASET,
             transform=self.preprocess,
@@ -804,6 +827,10 @@ class Stage2Trainer:
     
     def train_step(self, batch: Dict) -> Dict:
         """Execute single training step"""
+        assert self.model is not None, "Model not initialized"
+        assert self.projection_image is not None and self.projection_text is not None, "Projection heads not initialized"
+        assert self.optimizer is not None and self.scheduler is not None, "Optimizer not initialized"
+        assert self.clip_loss is not None, "Loss not initialized"
         self.model.train()
         self.projection_image.train()
         self.projection_text.train()
@@ -869,6 +896,9 @@ class Stage2Trainer:
     
     def save_checkpoint(self, tag: str = "latest"):
         """Save model checkpoint"""
+        assert self.model is not None, "Model not initialized"
+        assert self.projection_image is not None and self.projection_text is not None, "Projection heads not initialized"
+        assert self.optimizer is not None and self.scheduler is not None, "Optimizer not initialized"
         checkpoint_dir = self.config.OUTPUT_DIR
         
         # Save LoRA weights

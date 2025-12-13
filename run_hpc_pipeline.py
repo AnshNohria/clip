@@ -36,7 +36,8 @@ print(f"Device: {device}")
 print(f"GPU: {torch.cuda.get_device_name(0)}")
 print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
 print(f"PyTorch: {torch.__version__}")
-print(f"CUDA: {torch.version.cuda}")
+cuda_version = getattr(getattr(torch, "version", None), "cuda", "unknown")
+print(f"CUDA: {cuda_version}")
 
 # Set GPU memory management
 torch.cuda.empty_cache()
@@ -201,7 +202,7 @@ class Qwen2VLCaptioner:
                 messages, tokenize=False, add_generation_prompt=True
             )
             
-            image_inputs, video_inputs = self.process_vision_info(messages)
+            image_inputs, video_inputs, _ = self.process_vision_info(messages)
             inputs = self.processor(
                 text=[text], images=image_inputs, videos=video_inputs,
                 padding=True, return_tensors="pt"
@@ -582,7 +583,7 @@ class SD35ImageGenerator:
         print("\n[6/6] Loading Stable Diffusion 3.5 Medium...")
         
         try:
-            from diffusers import StableDiffusion3Pipeline
+            from diffusers.pipelines.stable_diffusion_3.pipeline_stable_diffusion_3 import StableDiffusion3Pipeline
             import gc
             
             # CRITICAL: Clear GPU memory before loading SD3.5
@@ -650,15 +651,22 @@ class SD35ImageGenerator:
             negative_prompt = "blurry, low quality, distorted, deformed, ugly, bad anatomy, watermark, text, extra objects, wrong count"
             
             # Generate with FULL 512-token support via T5 encoder
-            image = self.pipe(
+            result = self.pipe(
                 prompt=prompt,
                 negative_prompt=negative_prompt,
                 height=self.config.OUTPUT_IMAGE_SIZE,
                 width=self.config.OUTPUT_IMAGE_SIZE,
                 num_inference_steps=self.config.NUM_INFERENCE_STEPS,
                 guidance_scale=self.config.GUIDANCE_SCALE  # 8.5 for better adherence
-            ).images[0]
-            
+            )
+
+            # diffusers PipelineOutput has `.images`; fallback to tuple for stubs
+            if hasattr(result, "images"):
+                image = result.images[0]
+            else:
+                # type: ignore[index]
+                image = result[0]
+
             image.save(output_path)
             print(f"  ✓ Saved: {output_path.name}")
             return True

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """
 QUALITY FILTER: CLIP/RemoteCLIP Similarity Scoring + Sanity Checks
 
@@ -36,6 +37,12 @@ from collections import Counter
 import warnings
 warnings.filterwarnings('ignore')
 
+# Predeclare optional deps for type-checkers
+torch: Any = None
+F: Any = None
+Image: Any = None
+np: Any = None
+
 # Check for dependencies
 try:
     import torch
@@ -43,6 +50,8 @@ try:
     HAS_TORCH = True
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 except ImportError:
+    torch = None  # type: ignore[assignment]
+    F = None  # type: ignore[assignment]
     HAS_TORCH = False
     DEVICE = "cpu"
 
@@ -51,6 +60,8 @@ try:
     import numpy as np
     HAS_PIL = True
 except ImportError:
+    Image = None  # type: ignore[assignment]
+    np = None  # type: ignore[assignment]
     HAS_PIL = False
 
 # ============================================================================
@@ -102,10 +113,11 @@ class RemoteCLIPScorer:
     
     def __init__(self, config: QualityConfig):
         self.config = config
-        self.model = None
-        self.preprocess = None
-        self.tokenizer = None
-        self.model_type = None
+        from typing import Any
+        self.model: Optional[Any] = None
+        self.preprocess: Optional[Any] = None
+        self.tokenizer: Optional[Any] = None
+        self.model_type: Optional[str] = None
         
         self._init_model()
     
@@ -125,6 +137,7 @@ class RemoteCLIPScorer:
     
     def _try_load_remoteclip(self) -> bool:
         """Try to load RemoteCLIP model"""
+        assert self.preprocess is not None and self.tokenizer is not None
         try:
             import open_clip
             
@@ -186,11 +199,11 @@ class RemoteCLIPScorer:
     def _load_openai_clip(self):
         """Load OpenAI CLIP as fallback"""
         try:
-            import clip
+            import clip  # type: ignore
             
             print("[QualityFilter] Loading OpenAI CLIP (fallback)...")
-            self.model, self.preprocess = clip.load("ViT-B/32", device=DEVICE)
-            self.tokenizer = clip.tokenize
+            self.model, self.preprocess = clip.load("ViT-B/32", device=DEVICE)  # type: ignore[attr-defined]
+            self.tokenizer = clip.tokenize  # type: ignore[attr-defined]
             self.model_type = "OpenAI-CLIP"
             print("✓ OpenAI CLIP loaded")
             
@@ -213,13 +226,13 @@ class RemoteCLIPScorer:
             except Exception as e:
                 print(f"⚠ Could not load any CLIP model: {e}")
     
-    def compute_similarity(self, image: Image.Image, text: str) -> float:
+    def compute_similarity(self, image: Any, text: str) -> float:
         """
         Compute cosine similarity between image and text.
         
         Returns similarity score in [0, 1].
         """
-        if self.model is None:
+        if self.model is None or self.preprocess is None or self.tokenizer is None:
             return 0.5  # Neutral score if no model
         
         try:
@@ -227,10 +240,7 @@ class RemoteCLIPScorer:
             image_input = self.preprocess(image).unsqueeze(0).to(DEVICE)
             
             # Tokenize text
-            if self.model_type == "OpenAI-CLIP":
-                text_input = self.tokenizer([text], truncate=True).to(DEVICE)
-            else:
-                text_input = self.tokenizer([text]).to(DEVICE)
+            text_input = self.tokenizer([text]).to(DEVICE)
             
             # Compute embeddings
             with torch.no_grad():
@@ -259,8 +269,9 @@ class RemoteCLIPScorer:
                                   texts: List[str],
                                   batch_size: int = 32) -> List[float]:
         """Compute similarity for multiple pairs efficiently"""
-        if self.model is None:
+        if self.model is None or self.preprocess is None or self.tokenizer is None:
             return [0.5] * len(image_paths)
+        assert self.preprocess is not None and self.tokenizer is not None
         
         similarities = []
         
@@ -288,10 +299,7 @@ class RemoteCLIPScorer:
             
             # Tokenize texts
             valid_texts = [batch_texts[i] for i in valid_indices]
-            if self.model_type == "OpenAI-CLIP":
-                text_input = self.tokenizer(valid_texts, truncate=True).to(DEVICE)
-            else:
-                text_input = self.tokenizer(valid_texts).to(DEVICE)
+            text_input = self.tokenizer(valid_texts).to(DEVICE)
             
             # Compute embeddings
             with torch.no_grad():
@@ -506,12 +514,23 @@ class ImageQualityAnalyzer:
     def __init__(self, config: QualityConfig):
         self.config = config
     
-    def analyze(self, image: Image.Image) -> Dict:
+    def analyze(self, image: Any) -> Dict:
         """
         Analyze image quality.
         
         Returns dict with quality metrics.
         """
+        if np is None:
+            # Without numpy, fall back to neutral scores
+            return {
+                'brightness_score': 1.0,
+                'contrast_score': 1.0,
+                'blur_score': 1.0,
+                'artifact_score': 1.0,
+                'composite_image_quality': 1.0,
+                'brightness': 0.0,
+                'contrast': 0.0
+            }
         results = {
             'brightness_score': 1.0,
             'contrast_score': 1.0,
@@ -602,8 +621,10 @@ class QualityFilterPipeline:
     Main pipeline for quality filtering.
     """
     
-    def __init__(self, config: QualityConfig = None):
+    def __init__(self, config: Optional[QualityConfig] = None):
         self.config = config or QualityConfig()
+        if Image is None:
+            raise RuntimeError("PIL is required for quality filtering")
         
         # Initialize components
         self.clip_scorer = RemoteCLIPScorer(self.config)
@@ -758,8 +779,8 @@ class QualityFilterPipeline:
                 'original_count': len(pairs),
                 'filtered_count': len(final_pairs),
                 'removed_count': len(pairs) - len(final_pairs),
-                'avg_clip_score': np.mean([r.clip_score for r in final_reports]),
-                'avg_composite_score': np.mean([r.composite_score for r in final_reports])
+                'avg_clip_score': float(np.mean([r.clip_score for r in final_reports])) if np is not None else 0.0,
+                'avg_composite_score': float(np.mean([r.composite_score for r in final_reports])) if np is not None else 0.0
             },
             'pairs': final_pairs
         }
@@ -787,16 +808,16 @@ class QualityFilterPipeline:
             },
             'score_distribution': {
                 'clip_scores': {
-                    'min': min(r.clip_score for r in self.reports),
-                    'max': max(r.clip_score for r in self.reports),
-                    'mean': np.mean([r.clip_score for r in self.reports]),
-                    'std': np.std([r.clip_score for r in self.reports])
+                        'min': min(r.clip_score for r in self.reports),
+                        'max': max(r.clip_score for r in self.reports),
+                        'mean': float(np.mean([r.clip_score for r in self.reports])) if np is not None else 0.0,
+                        'std': float(np.std([r.clip_score for r in self.reports])) if np is not None else 0.0
                 },
                 'composite_scores': {
-                    'min': min(r.composite_score for r in self.reports),
-                    'max': max(r.composite_score for r in self.reports),
-                    'mean': np.mean([r.composite_score for r in self.reports]),
-                    'std': np.std([r.composite_score for r in self.reports])
+                        'min': min(r.composite_score for r in self.reports),
+                        'max': max(r.composite_score for r in self.reports),
+                        'mean': float(np.mean([r.composite_score for r in self.reports])) if np is not None else 0.0,
+                        'std': float(np.std([r.composite_score for r in self.reports])) if np is not None else 0.0
                 }
             },
             'per_pair_reports': [asdict(r) for r in self.reports]
