@@ -45,7 +45,8 @@ class Config:
     # Use environment variables for server deployment
     INPUT_DIR = Path(os.getenv("INPUT_DIR", "datasets/rsicd_images"))
     OUTPUT_DIR = Path(os.getenv("OUTPUT_DIR", "outputs/pipeline_results"))
-    CACHE_DIR = Path(os.getenv("HF_CACHE_DIR", "./hf_cache"))
+    # Use default HuggingFace cache on C: drive to save D: space
+    CACHE_DIR = Path(os.getenv("HF_HOME", os.path.expanduser("~/.cache/huggingface")))
     
     # Models
     UPSCALER_MODEL = "PyTorch-Bicubic"  # High-quality bicubic upscaling

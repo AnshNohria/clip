@@ -40,7 +40,8 @@ print(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:
 class BenchmarkConfig:
     INPUT_DIR = Path("datasets/rsicd_images")
     OUTPUT_DIR = Path("outputs/vlm_benchmark")
-    CACHE_DIR = Path("./hf_cache")
+    # Use default HuggingFace cache on C: drive to save D: space
+    CACHE_DIR = Path(os.path.expanduser("~/.cache/huggingface"))
     
     # Test on multiple images for robust comparison
     NUM_TEST_IMAGES = 5

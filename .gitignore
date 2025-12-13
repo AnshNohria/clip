@@ -39,6 +39,9 @@ datasets/WHURS19/
 datasets/*.csv
 datasets/*.txt
 
+# Generated visualization artifacts
+datasets/rsicd_images/*_regions.jpg
+
 # System files
 .DS_Store
 Thumbs.db
