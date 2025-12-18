@@ -190,8 +190,11 @@ class SyntheticGenerationPipeline:
         self.stage_times: Dict[str, List[float]] = {f"stage_{i}": [] for i in range(1, 11)}
         
         # Output paths
-        self.synthetic_dir = config.output_dir / "synthetic"
-        self.metadata_dir = config.output_dir / "metadata" / "synthetic"
+        # Place generated assets under top-level outputs/ per user request
+        self.output_root = config.output_dir.parent
+        self.synthetic_dir = self.output_root / "images"
+        self.metadata_dir = self.output_root / "metadeta"
+        self.synthetic_dir.mkdir(parents=True, exist_ok=True)
         self.metadata_dir.mkdir(parents=True, exist_ok=True)
     
     def setup(self):
@@ -698,18 +701,18 @@ Be specific and detailed for generating synthetic imagery."""
         """
         start_time = time.time()
 
-        # Object list (top 6)
+        # Object list (no limit)
         obj_parts = []
         for obj, count in sorted(
             extraction.object_inventory.items(), key=lambda x: x[1], reverse=True
-        )[:6]:
+        ):
             obj_parts.append(f"{count} {obj}{'s' if count > 1 else ''}")
         obj_text = ", ".join(obj_parts) if obj_parts else "a few structures"
 
-        # Spatial relationships (top 3)
+        # Spatial relationships (no limit)
         spatial_text = ""
         if detection.spatial_relationships:
-            spatial_text = " " + ". ".join(detection.spatial_relationships[:3]) + "."
+            spatial_text = " " + ". ".join(detection.spatial_relationships) + "."
 
         # Scene component
         scene_component = f"aerial satellite view of {extraction.scene_type} area"
@@ -987,12 +990,12 @@ Be specific and detailed for generating synthetic imagery."""
         ):
             obj_parts.append(f"{count} {obj}{'s' if count > 1 else ''}")
 
-        obj_text = ", ".join(obj_parts[:6]) if obj_parts else "a few structures"
+        obj_text = ", ".join(obj_parts) if obj_parts else "a few structures"
 
         # Build spatial relationships (top 3)
         spatial_text = ""
         if detection.spatial_relationships:
-            spatial_text = " " + ". ".join(detection.spatial_relationships[:3]) + "."
+            spatial_text = " " + ". ".join(detection.spatial_relationships) + "."
 
         # Construct paragraph
         caption = (
@@ -1219,15 +1222,15 @@ Be specific and detailed for generating synthetic imagery."""
             print(f"No images found in {source_images_dir}")
             return {"generated": 0, "quality_rate": 0.0}
         
-        # Update output directory
-        self.synthetic_dir = output_dir
+        # Ensure output directories (fixed locations)
         self.synthetic_dir.mkdir(parents=True, exist_ok=True)
+        self.metadata_dir.mkdir(parents=True, exist_ok=True)
         
         # Run pipeline
         result = self.run(source_images)
         
-        # Save dataset manifest
-        manifest_path = output_dir / "dataset.json"
+        # Save dataset manifest to metadata location
+        manifest_path = self.metadata_dir / "dataset.json"
         manifest = {
             "pairs": [
                 {

@@ -172,10 +172,10 @@ class PipelineConfig:
     # Global paths
     output_dir: Path = field(default_factory=lambda: Path("outputs/remoteclip_pipeline"))
     dataset_dir: Path = field(default_factory=lambda: Path("datasets/stage1_corpus"))
-    checkpoint_dir: Path = field(default_factory=lambda: Path("checkpoints/remoteclip_pipeline"))
+    checkpoint_dir: Path = field(default_factory=lambda: Path("checkpoints/remoteclip"))
     
     # GPU settings
-    device: str = "cuda:0"
+    device: str = "cuda"
     
     # Logging
     log_interval: int = 50

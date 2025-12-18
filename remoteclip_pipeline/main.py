@@ -139,8 +139,14 @@ class RemoteCLIPPipeline:
             
             target = target_count or self.config.synthetic.target_count
             
+            # Force source directory to RS-TransCLIP/datasets/rsicd_images
+            repo_root = Path(__file__).resolve().parent.parent
+            forced_source = repo_root / "RS-TransCLIP" / "datasets" / "rsicd_images"
+            if not forced_source.exists():
+                raise FileNotFoundError(f"Required input directory missing: {forced_source}")
+            
             result = self.synthetic_pipeline.generate_dataset(
-                source_images_dir=real_images_dir,
+                source_images_dir=forced_source,
                 output_dir=self.synthetic_dir,
                 target_count=target
             )
@@ -484,8 +490,9 @@ def parse_args():
     parser.add_argument(
         "--real-images",
         type=str,
-        required=True,
-        help="Directory with real satellite images"
+        required=False,
+        default=None,
+        help="Directory with real satellite images (ignored; pipeline uses RS-TransCLIP/datasets/rsicd_images)"
     )
     
     parser.add_argument(
@@ -561,7 +568,10 @@ def main():
     # Create pipeline
     pipeline = RemoteCLIPPipeline(config)
     
-    real_images_dir = Path(args.real_images)
+    # Always use RS-TransCLIP/datasets/rsicd_images as input source
+    repo_root = Path(__file__).resolve().parent.parent
+    fixed_real_dir = repo_root / "RS-TransCLIP" / "datasets" / "rsicd_images"
+    real_images_dir = fixed_real_dir
     rsicd_path = Path(args.rsicd_path) if args.rsicd_path else None
     
     # Run selected stage
