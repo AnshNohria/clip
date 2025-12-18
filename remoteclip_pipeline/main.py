@@ -546,9 +546,23 @@ def parse_args():
     return parser.parse_args()
 
 
+def _configure_hf_cache(repo_root: Path):
+    """Ensure Hugging Face cache resides in repo-local hf_cache unless user overrides."""
+    cache_dir = repo_root / "hf_cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    if not os.environ.get("HF_HOME"):
+        os.environ["HF_HOME"] = str(cache_dir)
+    if not os.environ.get("HUGGINGFACE_HUB_CACHE"):
+        os.environ["HUGGINGFACE_HUB_CACHE"] = str(cache_dir)
+
+
 def main():
     """Main entry point."""
     args = parse_args()
+
+    # Set HF cache to repo-local folder if not provided
+    repo_root = Path(__file__).resolve().parent.parent
+    _configure_hf_cache(repo_root)
     
     # Create config
     synthetic_cfg = SyntheticConfig()
@@ -569,7 +583,6 @@ def main():
     pipeline = RemoteCLIPPipeline(config)
     
     # Always use RS-TransCLIP/datasets/rsicd_images as input source
-    repo_root = Path(__file__).resolve().parent.parent
     fixed_real_dir = repo_root / "RS-TransCLIP" / "datasets" / "rsicd_images"
     real_images_dir = fixed_real_dir
     rsicd_path = Path(args.rsicd_path) if args.rsicd_path else None
