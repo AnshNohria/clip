@@ -693,39 +693,45 @@ Be specific and detailed for generating synthetic imagery."""
         detection: DetectionResult,
         segmentation: SegmentationResult
     ) -> GeneratedPrompt:
-        """Stage 5: Generate optimized SD prompt from metadata."""
+        """
+        Stage 5: Generate detailed paragraph prompt for SD 3.5 (< 300 tokens).
+        """
         start_time = time.time()
-        
-        # Scene component
-        scene_component = f"{extraction.scene_type} area"
-        
-        # Layout component
-        layout_component = extraction.layout_description
+
+        # Object list (top 6)
+        obj_parts = []
+        for obj, count in sorted(
+            extraction.object_inventory.items(), key=lambda x: x[1], reverse=True
+        )[:6]:
+            obj_parts.append(f"{count} {obj}{'s' if count > 1 else ''}")
+        obj_text = ", ".join(obj_parts) if obj_parts else "a few structures"
+
+        # Spatial relationships (top 3)
+        spatial_text = ""
         if detection.spatial_relationships:
-            layout_component += ". " + ", ".join(detection.spatial_relationships[:5])
-        
-        # Object component with positions
-        object_parts = []
-        for obj, count in extraction.object_inventory.items():
-            if count > 1:
-                object_parts.append(f"{count} {obj}s")
-            else:
-                object_parts.append(f"1 {obj}")
-        object_component = ", ".join(object_parts)
-        
+            spatial_text = " " + ". ".join(detection.spatial_relationships[:3]) + "."
+
+        # Scene component
+        scene_component = f"aerial satellite view of {extraction.scene_type} area"
+
+        # Layout component
+        layout_component = extraction.layout_description + spatial_text
+
+        # Object component
+        object_component = f"visible objects: {obj_text}"
+
         # Style component
         style_component = f"{extraction.appearance_details}, {extraction.lighting_conditions}"
-        
-        # Assemble full prompt
+
+        # Full paragraph prompt
         full_prompt = (
-            f"High-resolution aerial satellite view of {scene_component}. "
-            f"Layout: {layout_component}. "
-            f"Objects: {object_component}. "
-            f"Visual style: {style_component}. "
-            "Photorealistic remote sensing imagery, sharp details, natural colors, "
-            "top-down orthographic view, professional satellite photography."
+            f"High-resolution {scene_component} containing {obj_text}. "
+            f"{layout_component} The scene displays {extraction.appearance_details.lower()} "
+            f"captured during {extraction.lighting_conditions.lower()}. "
+            "Photorealistic remote sensing imagery with sharp detail, natural colors, "
+            "top-down orthographic view, professional satellite photography quality."
         )
-        
+
         result = GeneratedPrompt(
             full_prompt=full_prompt,
             scene_component=scene_component,
@@ -733,7 +739,7 @@ Be specific and detailed for generating synthetic imagery."""
             object_component=object_component,
             style_component=style_component
         )
-        
+
         self.stage_times["stage_5"].append(time.time() - start_time)
         return result
     
@@ -969,28 +975,35 @@ Be specific and detailed for generating synthetic imagery."""
         extraction: ExtractionResult,
         detection: DetectionResult
     ) -> str:
-        """Generate refined caption from verification pass."""
-        # Build object list with counts
-        objects = []
-        for obj, count in extraction.object_inventory.items():
-            if count > 1:
-                objects.append(f"{count} {obj}s")
-            else:
-                objects.append(obj)
-        
-        # Build caption
-        caption = f"Aerial view of {extraction.scene_type} area"
-        
-        if objects:
-            caption += f" containing {', '.join(objects[:5])}"
-        
+        """
+        Generate detailed paragraph caption from verification (< 300 tokens).
+        Creates natural description of synthetic image based on second-pass analysis.
+        """
+
+        # Build object list naturally
+        obj_parts = []
+        for obj, count in sorted(
+            extraction.object_inventory.items(), key=lambda x: x[1], reverse=True
+        ):
+            obj_parts.append(f"{count} {obj}{'s' if count > 1 else ''}")
+
+        obj_text = ", ".join(obj_parts[:6]) if obj_parts else "a few structures"
+
+        # Build spatial relationships (top 3)
+        spatial_text = ""
         if detection.spatial_relationships:
-            caption += f". {detection.spatial_relationships[0]}"
-        
-        if extraction.appearance_details and extraction.appearance_details != "Natural colors and textures":
-            caption += f". {extraction.appearance_details[:100]}"
-        
-        return caption + "."
+            spatial_text = " " + ". ".join(detection.spatial_relationships[:3]) + "."
+
+        # Construct paragraph
+        caption = (
+            f"This aerial satellite image captures a {extraction.scene_type} area "
+            f"containing {obj_text}. {extraction.layout_description}.{spatial_text} "
+            f"The scene shows {extraction.appearance_details.lower()} "
+            f"under {extraction.lighting_conditions.lower()}, providing clear detail "
+            f"in this high-resolution remote sensing imagery."
+        )
+
+        return caption
     
     # =========================================================================
     # MAIN PIPELINE EXECUTION
