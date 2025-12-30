@@ -1,0 +1,46 @@
+# HPC Pipeline Requirements
+# Enhanced RS Image Processing Pipeline
+
+# Core PyTorch (install with CUDA using: pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124)
+torch
+torchvision
+
+# Diffusion models
+diffusers
+accelerate
+safetensors
+
+# Transformers for Qwen2-VL, Phi-3.5, etc.
+transformers
+tokenizers
+qwen-vl-utils==0.0.8
+
+# Grounding DINO dependencies
+supervision
+groundingdino-py
+
+# SAM (Segment Anything Model)
+segment-anything
+
+# Image processing
+Pillow
+opencv-python-headless
+sentencepiece
+
+# Utilities
+tqdm
+numpy
+scipy
+
+# HuggingFace Hub
+huggingface-hub
+
+# Development tools
+ipython
+
+# CLIP models
+open-clip-torch
+
+# Image enhancement
+basicsr
+realesrgan
