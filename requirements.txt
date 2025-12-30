@@ -14,6 +14,7 @@ safetensors
 transformers
 tokenizers
 qwen-vl-utils==0.0.8
+bitsandbytes  # For 4-bit quantization
 
 # Grounding DINO dependencies
 supervision
@@ -41,7 +42,3 @@ ipython
 
 # CLIP models
 open-clip-torch
-
-# Image enhancement
-basicsr
-realesrgan

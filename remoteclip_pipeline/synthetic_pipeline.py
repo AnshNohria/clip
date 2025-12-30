@@ -201,6 +201,21 @@ class SyntheticGenerationPipeline:
         """Setup method - alias for load_models()."""
         self.load_models()
     
+    def _clear_gpu_memory(self):
+        """Clear GPU memory cache."""
+        if HAS_TORCH and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            import gc
+            gc.collect()
+    
+    def _get_free_gpu_memory(self) -> float:
+        """Get free GPU memory in GB."""
+        if HAS_TORCH and torch.cuda.is_available():
+            free_mem = torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated(0)
+            return free_mem / (1024**3)
+        return 0.0
+    
     def load_models(self):
         """Load all required models to GPU."""
         if not HAS_TORCH:
@@ -210,74 +225,64 @@ class SyntheticGenerationPipeline:
         print("LOADING MODELS FOR SYNTHETIC PIPELINE")
         print("="*80)
         
-        # Stage 1: Real-ESRGAN
-        print("\n[1/7] Loading Real-ESRGAN...")
-        self._load_esrgan()
+        # Clear GPU memory first
+        self._clear_gpu_memory()
+        print(f"\nInitial free GPU memory: {self._get_free_gpu_memory():.2f} GB")
         
-        # Stage 2: Qwen2-VL
-        print("\n[2/7] Loading Qwen2-VL...")
+        # Real-ESRGAN removed - not needed for this pipeline
+        self.esrgan_model = None
+        
+        # Stage 2: Qwen2-VL (full 7B model)
+        print("\n[1/5] Loading Qwen2-VL-7B...")
+        self._clear_gpu_memory()
         self._load_qwen()
         
         # Stage 3: Grounding DINO
-        print("\n[3/7] Loading Grounding DINO...")
+        print("\n[2/5] Loading Grounding DINO...")
+        self._clear_gpu_memory()
         self._load_grounding_dino()
         
-        # Stage 4: SAM
-        print("\n[4/7] Loading SAM...")
+        # Stage 4: SAM (full huge model)
+        print("\n[3/5] Loading SAM-ViT-Huge...")
+        self._clear_gpu_memory()
         self._load_sam()
         
         # Stage 6: SD 3.5
-        print("\n[5/7] Loading Stable Diffusion 3.5...")
+        print("\n[4/5] Loading Stable Diffusion 3.5...")
+        self._clear_gpu_memory()
         self._load_sd()
         
         # CLIP for scoring
-        print("\n[6/7] Loading CLIP for quality scoring...")
+        print("\n[5/5] Loading CLIP for quality scoring...")
+        self._clear_gpu_memory()
         self._load_clip()
         
-        print("\n[7/7] All models loaded!")
+        print(f"\nFinal free GPU memory: {self._get_free_gpu_memory():.2f} GB")
+        print("\nAll models loaded!")
         print("="*80)
     
-    def _load_esrgan(self):
-        """Load Real-ESRGAN model."""
-        try:
-            from basicsr.archs.rrdbnet_arch import RRDBNet
-            from realesrgan import RealESRGANer
-            
-            model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, 
-                           num_block=23, num_grow_ch=32, scale=4)
-            
-            self.esrgan_model = RealESRGANer(
-                scale=self.synthetic_config.esrgan_scale,
-                model_path=None,  # Uses default
-                model=model,
-                tile=400,
-                tile_pad=10,
-                pre_pad=0,
-                half=True,
-                device=self.device
-            )
-            print("  ✓ Real-ESRGAN loaded")
-        except ImportError:
-            print("  ⚠ Real-ESRGAN not available, will skip upsampling")
-            self.esrgan_model = None
-    
     def _load_qwen(self):
-        """Load Qwen2-VL model."""
+        """Load Qwen2-VL-7B model."""
         try:
             from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
             
             self.qwen_model = Qwen2VLForConditionalGeneration.from_pretrained(
                 self.synthetic_config.qwen_model,
                 torch_dtype=torch.bfloat16,
-                device_map=self.device
+                device_map="auto",
+                trust_remote_code=True,
+                low_cpu_mem_usage=True
             )
             self.qwen_processor = AutoProcessor.from_pretrained(
-                self.synthetic_config.qwen_model
+                self.synthetic_config.qwen_model,
+                trust_remote_code=True
             )
-            print("  ✓ Qwen2-VL loaded")
-        except ImportError:
-            print("  ⚠ Qwen2-VL not available")
+            print(f"  ✓ Qwen2-VL-7B loaded")
+            print(f"    Free GPU memory: {self._get_free_gpu_memory():.2f} GB")
+        except Exception as e:
+            print(f"  ⚠ Qwen2-VL not available: {e}")
             self.qwen_model = None
+            self.qwen_processor = None
     
     def _load_grounding_dino(self):
         """Load Grounding DINO model."""
@@ -288,28 +293,36 @@ class SyntheticGenerationPipeline:
                 self.synthetic_config.gdino_model
             )
             self.gdino_model = AutoModelForZeroShotObjectDetection.from_pretrained(
-                self.synthetic_config.gdino_model
+                self.synthetic_config.gdino_model,
+                torch_dtype=torch.bfloat16,
+                low_cpu_mem_usage=True
             ).to(self.device)
             print("  ✓ Grounding DINO loaded")
-        except ImportError:
-            print("  ⚠ Grounding DINO not available")
+            print(f"    Free GPU memory: {self._get_free_gpu_memory():.2f} GB")
+        except Exception as e:
+            print(f"  ⚠ Grounding DINO not available: {e}")
             self.gdino_model = None
+            self.gdino_processor = None
     
     def _load_sam(self):
-        """Load SAM model."""
+        """Load SAM-ViT-Huge model."""
         try:
             from transformers import SamModel, SamProcessor
             
             self.sam_model = SamModel.from_pretrained(
-                self.synthetic_config.sam_model
+                self.synthetic_config.sam_model,
+                torch_dtype=torch.bfloat16,
+                low_cpu_mem_usage=True
             ).to(self.device)
             self.sam_processor = SamProcessor.from_pretrained(
                 self.synthetic_config.sam_model
             )
-            print("  ✓ SAM loaded")
-        except ImportError:
-            print("  ⚠ SAM not available")
+            print(f"  ✓ SAM-ViT-Huge loaded")
+            print(f"    Free GPU memory: {self._get_free_gpu_memory():.2f} GB")
+        except Exception as e:
+            print(f"  ⚠ SAM not available: {e}")
             self.sam_model = None
+            self.sam_processor = None
     
     def _load_sd(self):
         """Load Stable Diffusion 3.5 pipeline."""
@@ -318,14 +331,18 @@ class SyntheticGenerationPipeline:
             
             self.sd_pipeline = StableDiffusion3Pipeline.from_pretrained(
                 self.synthetic_config.sd_model,
-                torch_dtype=torch.bfloat16
+                torch_dtype=torch.bfloat16,
+                low_cpu_mem_usage=True
             ).to(self.device)
             
             # Enable memory optimizations
             self.sd_pipeline.enable_attention_slicing()
+            if hasattr(self.sd_pipeline, 'enable_vae_slicing'):
+                self.sd_pipeline.enable_vae_slicing()
             print("  ✓ Stable Diffusion 3.5 loaded")
-        except ImportError:
-            print("  ⚠ Stable Diffusion 3.5 not available")
+            print(f"    Free GPU memory: {self._get_free_gpu_memory():.2f} GB")
+        except Exception as e:
+            print(f"  ⚠ Stable Diffusion 3.5 not available: {e}")
             self.sd_pipeline = None
     
     def _load_clip(self):
@@ -343,28 +360,6 @@ class SyntheticGenerationPipeline:
         except ImportError:
             print("  ⚠ CLIP not available for scoring")
             self.clip_model = None
-    
-    # =========================================================================
-    # STAGE 1: Real-ESRGAN Upsampling
-    # =========================================================================
-    
-    def stage1_upsample(self, image: Any) -> Any:
-        """Stage 1: Upsample image using Real-ESRGAN."""
-        start_time = time.time()
-        
-        if self.esrgan_model is None:
-            return image
-        
-        try:
-            img_array = np.array(image)
-            output, _ = self.esrgan_model.enhance(img_array, outscale=4)
-            result = Image.fromarray(output)
-        except Exception as e:
-            print(f"  ⚠ ESRGAN failed: {e}")
-            result = image
-        
-        self.stage_times["stage_1"].append(time.time() - start_time)
-        return result
     
     # =========================================================================
     # STAGE 2: Qwen2-VL Dense Scene Analysis
@@ -755,7 +750,7 @@ Be specific and detailed for generating synthetic imagery."""
         prompt: GeneratedPrompt,
         original_image: Optional[Any] = None
     ) -> Tuple[Optional[Any], Dict[str, Any]]:
-        """Stage 6: Generate synthetic image using SD 3.5."""
+        """Stage 6: Generate synthetic image using Stable Diffusion 3.5."""
         start_time = time.time()
         
         if self.sd_pipeline is None:
@@ -1013,30 +1008,27 @@ Be specific and detailed for generating synthetic imagery."""
     # =========================================================================
     
     def process_single_image(self, image_path: Path) -> Optional[SyntheticSample]:
-        """Process a single image through all 10 stages."""
+        """Process a single image through all stages (Real-ESRGAN removed)."""
         try:
             sample_id = str(uuid.uuid4())[:8]
             
             # Load source image
             source_image = Image.open(image_path).convert('RGB')
             
-            # Stage 1: Upsample
-            upsampled = self.stage1_upsample(source_image)
-            
-            # Stage 2: Scene analysis
-            extraction = self.stage2_scene_analysis(upsampled)
+            # Stage 2: Scene analysis (directly on source image, no upsampling)
+            extraction = self.stage2_scene_analysis(source_image)
             
             # Stage 3: Layout detection
-            detection = self.stage3_layout_detection(upsampled, extraction.object_inventory)
+            detection = self.stage3_layout_detection(source_image, extraction.object_inventory)
             
             # Stage 4: Segmentation
-            segmentation = self.stage4_segmentation(upsampled, detection)
+            segmentation = self.stage4_segmentation(source_image, detection)
             
             # Stage 5: Generate prompt
             prompt = self.stage5_generate_prompt(extraction, detection, segmentation)
             
             # Stage 6: Generate synthetic image
-            synthetic_image, gen_params = self.stage6_generate_image(prompt, upsampled)
+            synthetic_image, gen_params = self.stage6_generate_image(prompt, source_image)
             
             if synthetic_image is None:
                 self.failed_count += 1
