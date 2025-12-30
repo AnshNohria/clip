@@ -17,12 +17,64 @@ Stage 1 includes the 10-stage synthetic generation pipeline:
 
 Usage:
     python run_stage1.py
-    python run_stage1.py --images-dir path/to/images --target-count 100
+    python run_stage1.py --images-dir path/to/images
 """
 import os
 import sys
 import argparse
 from pathlib import Path
+
+
+def load_env_file(env_path: Path):
+    """Load environment variables from .env file."""
+    if not env_path.exists():
+        print(f"WARNING: .env file not found at {env_path}")
+        return False
+    
+    with open(env_path, "r") as f:
+        for line in f:
+            line = line.strip()
+            # Skip comments and empty lines
+            if not line or line.startswith("#"):
+                continue
+            # Parse KEY=VALUE
+            if "=" in line:
+                key, value = line.split("=", 1)
+                key = key.strip()
+                value = value.strip().strip('"').strip("'")
+                os.environ[key] = value
+    return True
+
+
+def setup_huggingface_auth(script_dir: Path):
+    """Setup HuggingFace authentication and cache directory."""
+    # Load .env file
+    env_path = script_dir / ".env"
+    load_env_file(env_path)
+    
+    # Setup checkpoints directory for HuggingFace cache
+    hf_cache_dir = script_dir / "checkpoints" / "huggingface"
+    hf_cache_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Set HuggingFace environment variables to use local cache
+    os.environ["HF_HOME"] = str(hf_cache_dir)
+    os.environ["HUGGINGFACE_HUB_CACHE"] = str(hf_cache_dir)
+    os.environ["TRANSFORMERS_CACHE"] = str(hf_cache_dir)
+    os.environ["HF_DATASETS_CACHE"] = str(hf_cache_dir / "datasets")
+    
+    # Check for HuggingFace token
+    hf_token = os.environ.get("HUGGINGFACE_HUB_TOKEN") or os.environ.get("HF_TOKEN")
+    if hf_token:
+        os.environ["HF_TOKEN"] = hf_token
+        os.environ["HUGGINGFACE_HUB_TOKEN"] = hf_token
+        print(f"✓ HuggingFace token loaded from .env")
+    else:
+        print("WARNING: No HuggingFace token found in .env file")
+        print("  Some models (like SD 3.5) may require authentication")
+        print("  Add HUGGINGFACE_HUB_TOKEN=your_token to .env file")
+    
+    print(f"✓ Model cache directory: {hf_cache_dir}")
+    return hf_cache_dir
 
 
 def main():
@@ -36,14 +88,8 @@ def main():
     parser.add_argument(
         "--output-dir",
         type=str,
-        default="outputs",
-        help="Output directory for synthetic images and metadata"
-    )
-    parser.add_argument(
-        "--target-count",
-        type=int,
-        default=100,
-        help="Target number of synthetic samples to generate (default: 100)"
+        default=None,
+        help="Output directory for synthetic images and metadata (default: outputs in clip folder)"
     )
     parser.add_argument(
         "--device",
@@ -66,14 +112,38 @@ def main():
     
     args = parser.parse_args()
     
-    # Determine the project root
+    # Determine the project root (clip folder)
     script_dir = Path(__file__).resolve().parent
     
-    # Default images directory
+    # Setup HuggingFace authentication and cache BEFORE importing any HF libraries
+    print("=" * 70)
+    print("SETTING UP ENVIRONMENT")
+    print("=" * 70)
+    hf_cache_dir = setup_huggingface_auth(script_dir)
+    
+    # Default images directory - datasets/rsicd_images in clip folder
     if args.images_dir is None:
         images_dir = script_dir / "datasets" / "rsicd_images"
     else:
         images_dir = Path(args.images_dir)
+    
+    # Output directory - outputs folder in clip folder
+    if args.output_dir is None:
+        output_dir = script_dir / "outputs"
+    else:
+        output_dir = Path(args.output_dir)
+    
+    # Create output directories
+    output_dir.mkdir(parents=True, exist_ok=True)
+    images_output_dir = output_dir / "images"
+    captions_output_dir = output_dir / "captions"
+    metadata_output_dir = output_dir / "metadata"
+    checkpoints_dir = script_dir / "checkpoints"
+    
+    images_output_dir.mkdir(parents=True, exist_ok=True)
+    captions_output_dir.mkdir(parents=True, exist_ok=True)
+    metadata_output_dir.mkdir(parents=True, exist_ok=True)
+    checkpoints_dir.mkdir(parents=True, exist_ok=True)
     
     # Validate images directory
     if not images_dir.exists():
@@ -83,7 +153,7 @@ def main():
         print("\nOr specify a custom path with --images-dir")
         return 1
     
-    # Count available images
+    # Count ALL available images
     image_extensions = ['.jpg', '.jpeg', '.png', '.bmp', '.tif', '.tiff']
     image_files = []
     for ext in image_extensions:
@@ -94,13 +164,19 @@ def main():
         print(f"ERROR: No images found in {images_dir}")
         return 1
     
+    # Process ALL images - set target to total count
+    total_images = len(image_files)
+    
     print("=" * 70)
     print("STAGE 1: SYNTHETIC GENERATION PIPELINE")
     print("=" * 70)
     print(f"Images directory: {images_dir}")
-    print(f"Found {len(image_files)} images")
-    print(f"Output directory: {args.output_dir}")
-    print(f"Target count: {args.target_count}")
+    print(f"Found {total_images} images - will process ALL")
+    print(f"Output directory: {output_dir}")
+    print(f"  - Generated images: {images_output_dir}")
+    print(f"  - Captions: {captions_output_dir}")
+    print(f"  - Metadata: {metadata_output_dir}")
+    print(f"Checkpoints directory: {checkpoints_dir}")
     print(f"Device: {args.device}")
     print(f"Quality thresholds: CLIP>{args.min_clip_score}, IoU>{args.min_layout_iou}")
     print("=" * 70)
@@ -114,15 +190,16 @@ def main():
         print("\nMake sure you're running from the project root directory")
         return 1
     
-    # Configure the pipeline
+    # Configure the pipeline - process ALL images
     synthetic_config = SyntheticConfig()
-    synthetic_config.target_synthetic_count = args.target_count
+    synthetic_config.target_synthetic_count = total_images  # Process ALL images
     synthetic_config.min_clip_score = args.min_clip_score
     synthetic_config.min_layout_iou = args.min_layout_iou
     
     config = PipelineConfig(
         device=args.device,
-        output_dir=Path(args.output_dir) / "remoteclip_pipeline",
+        output_dir=output_dir,
+        checkpoint_dir=checkpoints_dir,
         synthetic=synthetic_config
     )
     
@@ -130,28 +207,44 @@ def main():
     print("\nInitializing Synthetic Generation Pipeline...")
     pipeline = SyntheticGenerationPipeline(config)
     
+    # Override output directories to use our structure
+    pipeline.synthetic_dir = images_output_dir
+    pipeline.metadata_dir = metadata_output_dir
+    
     try:
         print("\nLoading models (this may take a few minutes)...")
         pipeline.setup()
         
-        print(f"\nProcessing images from: {images_dir}")
-        print(f"Output will be saved to: {pipeline.synthetic_dir}")
-        print(f"Metadata will be saved to: {pipeline.metadata_dir}")
+        print(f"\nProcessing ALL {total_images} images from: {images_dir}")
+        print(f"Generated images will be saved to: {images_output_dir}")
+        print(f"Metadata will be saved to: {metadata_output_dir}")
         
         result = pipeline.generate_dataset(
             source_images_dir=images_dir,
-            output_dir=Path(args.output_dir),
-            target_count=args.target_count
+            output_dir=output_dir,
+            target_count=total_images  # Process ALL images
         )
+        
+        # Save captions to separate file
+        captions_file = captions_output_dir / "captions.txt"
+        if result.get("samples"):
+            with open(captions_file, "w", encoding="utf-8") as f:
+                for sample in result["samples"]:
+                    image_name = Path(sample.synthetic_image_path).name
+                    caption = sample.refined_caption
+                    f.write(f"{image_name}\t{caption}\n")
+            print(f"Captions saved to: {captions_file}")
         
         print("\n" + "=" * 70)
         print("STAGE 1 COMPLETE")
         print("=" * 70)
-        print(f"Generated samples: {result.get('generated', 0)}")
+        print(f"Total images processed: {total_images}")
+        print(f"Successfully generated: {result.get('generated', 0)}")
         print(f"Quality rate: {result.get('quality_rate', 0) * 100:.1f}%")
         print(f"Manifest saved to: {result.get('manifest_path', 'N/A')}")
-        print(f"Images saved to: {pipeline.synthetic_dir}")
-        print(f"Metadata saved to: {pipeline.metadata_dir}")
+        print(f"Generated images: {images_output_dir}")
+        print(f"Captions: {captions_output_dir}")
+        print(f"Metadata: {metadata_output_dir}")
         print("=" * 70)
         
         return 0
