@@ -182,6 +182,10 @@ class SyntheticGenerationPipeline:
         self.sd_pipeline: Optional[Any] = None
         self.clip_model: Optional[Any] = None
         self.clip_preprocess: Optional[Any] = None
+        self.clip_tokenizer: Optional[Any] = None
+        
+        # Track which models are currently loaded
+        self._models_loaded: set = set()
         
         # Statistics
         self.processed_count = 0
@@ -206,9 +210,9 @@ class SyntheticGenerationPipeline:
         print(f"Available GPU memory: {self._get_actual_free_gpu_memory():.2f} GB")
         print("="*80)
         
-        # Initialize model references
+        # Reset model references (in case of re-initialization)
         self.esrgan_model = None
-        self._models_loaded = set()
+        self._models_loaded.clear()
     
     def _clear_gpu_memory(self):
         """Clear GPU memory cache."""
@@ -458,7 +462,11 @@ Be specific and detailed for generating synthetic imagery."""
                 videos=video_inputs,
                 padding=True,
                 return_tensors="pt"
-            ).to(self.device)
+            )
+            
+            # Move inputs to the same device as the first model parameter
+            model_device = next(self.qwen_model.parameters()).device
+            inputs = {k: v.to(model_device) if hasattr(v, 'to') else v for k, v in inputs.items()}
             
             with torch.no_grad():
                 output_ids = self.qwen_model.generate(
@@ -467,7 +475,7 @@ Be specific and detailed for generating synthetic imagery."""
                 )
             
             response = self.qwen_processor.batch_decode(
-                output_ids[:, inputs.input_ids.shape[1]:],
+                output_ids[:, inputs["input_ids"].shape[1]:],
                 skip_special_tokens=True
             )[0]
             
@@ -861,7 +869,8 @@ Be specific and detailed for generating synthetic imagery."""
     # =========================================================================
     # STAGES 7-9: Second-Pass Verification
     # =========================================================================
-        def stage7_verify_scene(self, synthetic_image: Any) -> ExtractionResult:
+    
+    def stage7_verify_scene(self, synthetic_image: Any) -> ExtractionResult:
         """Stage 7: Second-pass scene analysis on synthetic image."""
         start_time = time.time()
         result = self.stage2_scene_analysis(synthetic_image)
