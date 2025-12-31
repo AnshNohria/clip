@@ -308,7 +308,7 @@ class SyntheticGenerationPipeline:
             
             self.qwen_model = Qwen2VLForConditionalGeneration.from_pretrained(
                 self.synthetic_config.qwen_model,
-                torch_dtype=torch.bfloat16,
+                torch_dtype=torch.float16,
                 device_map="auto",
                 trust_remote_code=True,
                 low_cpu_mem_usage=True
@@ -334,12 +334,11 @@ class SyntheticGenerationPipeline:
             self.gdino_processor = AutoProcessor.from_pretrained(
                 self.synthetic_config.gdino_model
             )
+            # Use float32 for stable inference (like working pipeline)
             self.gdino_model = AutoModelForZeroShotObjectDetection.from_pretrained(
                 self.synthetic_config.gdino_model,
-                torch_dtype=torch.bfloat16,
-                device_map="auto",
-                low_cpu_mem_usage=True
-            )
+                torch_dtype=torch.float32
+            ).to(self.device).eval()
             self._models_loaded.add("gdino")
             print(f"  ✓ Grounding DINO loaded (Free GPU: {self._get_actual_free_gpu_memory():.2f} GB)")
         except Exception as e:
@@ -354,15 +353,14 @@ class SyntheticGenerationPipeline:
             
             print(f"  Loading SAM-ViT-Huge... (Free GPU: {self._get_actual_free_gpu_memory():.2f} GB)")
             
-            self.sam_model = SamModel.from_pretrained(
-                self.synthetic_config.sam_model,
-                torch_dtype=torch.bfloat16,
-                device_map="auto",
-                low_cpu_mem_usage=True
-            )
             self.sam_processor = SamProcessor.from_pretrained(
                 self.synthetic_config.sam_model
             )
+            # Use float32 for compatibility (like working pipeline)
+            self.sam_model = SamModel.from_pretrained(
+                self.synthetic_config.sam_model,
+                torch_dtype=torch.float32
+            ).to(self.device).eval()
             self._models_loaded.add("sam")
             print(f"  ✓ SAM-ViT-Huge loaded (Free GPU: {self._get_actual_free_gpu_memory():.2f} GB)")
         except Exception as e:
@@ -514,14 +512,16 @@ Be specific and detailed for generating synthetic imagery."""
                 return_tensors="pt"
             )
             
-            # Move inputs to the same device and dtype as model
+            # Move inputs to the same device and convert floats to float16
             model_device = next(self.qwen_model.parameters()).device
-            model_dtype = next(self.qwen_model.parameters()).dtype
             processed_inputs = {}
             for k, v in inputs.items():
                 if hasattr(v, 'to'):
-                    if hasattr(v, 'is_floating_point') and v.is_floating_point():
-                        processed_inputs[k] = v.to(device=model_device, dtype=model_dtype)
+                    if k in ('pixel_values', 'image_embeds'):
+                        # Pixel values must match model dtype (float16)
+                        processed_inputs[k] = v.to(device=model_device, dtype=torch.float16)
+                    elif hasattr(v, 'is_floating_point') and v.is_floating_point():
+                        processed_inputs[k] = v.to(device=model_device, dtype=torch.float16)
                     else:
                         processed_inputs[k] = v.to(device=model_device)
                 else:
@@ -663,20 +663,7 @@ Be specific and detailed for generating synthetic imagery."""
                 images=image,
                 text=text_prompt,
                 return_tensors="pt"
-            )
-            # Move inputs to the same device and dtype as model
-            device = next(self.gdino_model.parameters()).device
-            dtype = next(self.gdino_model.parameters()).dtype
-            processed_inputs = {}
-            for k, v in inputs.items():
-                if hasattr(v, 'to'):
-                    if hasattr(v, 'is_floating_point') and v.is_floating_point():
-                        processed_inputs[k] = v.to(device=device, dtype=dtype)
-                    else:
-                        processed_inputs[k] = v.to(device=device)
-                else:
-                    processed_inputs[k] = v
-            inputs = processed_inputs
+            ).to(self.device)
             
             with torch.no_grad():
                 outputs = self.gdino_model(**inputs)
@@ -779,27 +766,18 @@ Be specific and detailed for generating synthetic imagery."""
                 input_boxes=[input_boxes],
                 return_tensors="pt"
             )
-            # Move inputs to the same device and dtype as model
-            device = next(self.sam_model.parameters()).device
-            dtype = next(self.sam_model.parameters()).dtype
-            processed_inputs = {}
-            for k, v in inputs.items():
-                if hasattr(v, 'to'):
-                    if hasattr(v, 'is_floating_point') and v.is_floating_point():
-                        processed_inputs[k] = v.to(device=device, dtype=dtype)
-                    else:
-                        processed_inputs[k] = v.to(device=device)
-                else:
-                    processed_inputs[k] = v
-            inputs = processed_inputs
+            # Move inputs to device
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
             
             with torch.no_grad():
                 outputs = self.sam_model(**inputs)
             
-            masks = self.sam_processor.image_processor.post_process_masks(
+            # Use processor.post_process_masks (not image_processor)
+            masks = self.sam_processor.post_process_masks(
                 outputs.pred_masks.cpu(),
                 inputs["original_sizes"].cpu(),
-                inputs["reshaped_input_sizes"].cpu()
+                inputs["reshaped_input_sizes"].cpu(),
+                binarize=False
             )
             
             # Extract boundaries and areas
@@ -807,13 +785,20 @@ Be specific and detailed for generating synthetic imagery."""
             areas = []
             mask_list = []
             
-            for mask_batch in masks:
-                for mask in mask_batch:
-                    mask_np = mask.numpy().squeeze()
-                    mask_list.append(mask_np)
-                    areas.append(int(mask_np.sum()))
-                    # Simplified boundary extraction
-                    boundaries.append([])
+            # masks is a list of tensors, one per image
+            if masks and len(masks) > 0:
+                mask_tensor = masks[0]  # First image
+                # Handle different tensor shapes
+                if mask_tensor.dim() >= 2:
+                    for i in range(mask_tensor.shape[0] if mask_tensor.dim() > 2 else 1):
+                        if mask_tensor.dim() > 2:
+                            mask_np = mask_tensor[i, 0].numpy() if mask_tensor.dim() > 3 else mask_tensor[i].numpy()
+                        else:
+                            mask_np = mask_tensor.numpy()
+                        mask_np = mask_np.squeeze()
+                        mask_list.append(mask_np)
+                        areas.append(int((mask_np > 0.5).sum()))
+                        boundaries.append([])
             
             result = SegmentationResult(
                 masks=mask_list,
