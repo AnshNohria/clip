@@ -215,12 +215,15 @@ class SyntheticGenerationPipeline:
         self._models_loaded.clear()
     
     def _clear_gpu_memory(self):
-        """Clear GPU memory cache."""
+        """Clear GPU memory cache aggressively."""
+        import gc
+        gc.collect()
         if HAS_TORCH and torch.cuda.is_available():
             torch.cuda.empty_cache()
             torch.cuda.synchronize()
-            import gc
+            torch.cuda.reset_peak_memory_stats()
             gc.collect()
+            torch.cuda.empty_cache()
     
     def _get_free_gpu_memory(self) -> float:
         """Get free GPU memory in GB (PyTorch allocated view)."""
@@ -368,25 +371,27 @@ class SyntheticGenerationPipeline:
             self.sam_processor = None
     
     def _load_sd(self):
-        """Load Stable Diffusion 3.5 pipeline."""
+        """Load Stable Diffusion 3.5 pipeline with aggressive memory optimization."""
         try:
             from diffusers import StableDiffusion3Pipeline
             
             print(f"  Loading Stable Diffusion 3.5... (Free GPU: {self._get_actual_free_gpu_memory():.2f} GB)")
             
+            # Load to CPU first, then use sequential offloading
             self.sd_pipeline = StableDiffusion3Pipeline.from_pretrained(
                 self.synthetic_config.sd_model,
-                torch_dtype=torch.bfloat16,
-                device_map="balanced",
+                torch_dtype=torch.float16,
                 low_cpu_mem_usage=True
             )
             
-            # Enable memory optimizations
-            self.sd_pipeline.enable_attention_slicing()
+            # Use sequential CPU offload - only keeps one layer on GPU at a time
+            self.sd_pipeline.enable_sequential_cpu_offload()
+            self.sd_pipeline.enable_attention_slicing(1)
             if hasattr(self.sd_pipeline, 'enable_vae_slicing'):
                 self.sd_pipeline.enable_vae_slicing()
-            if hasattr(self.sd_pipeline, 'enable_model_cpu_offload'):
-                self.sd_pipeline.enable_model_cpu_offload()
+            if hasattr(self.sd_pipeline, 'enable_vae_tiling'):
+                self.sd_pipeline.enable_vae_tiling()
+            
             self._models_loaded.add("sd")
             print(f"  ✓ Stable Diffusion 3.5 loaded (Free GPU: {self._get_actual_free_gpu_memory():.2f} GB)")
         except Exception as e:
@@ -464,9 +469,10 @@ Be specific and detailed for generating synthetic imagery."""
                 return_tensors="pt"
             )
             
-            # Move inputs to the same device as the first model parameter
+            # Move inputs to the same device and dtype as model
             model_device = next(self.qwen_model.parameters()).device
-            inputs = {k: v.to(model_device) if hasattr(v, 'to') else v for k, v in inputs.items()}
+            model_dtype = next(self.qwen_model.parameters()).dtype
+            inputs = {k: v.to(device=model_device, dtype=model_dtype) if hasattr(v, 'to') and v.is_floating_point() else (v.to(model_device) if hasattr(v, 'to') else v) for k, v in inputs.items()}
             
             with torch.no_grad():
                 output_ids = self.qwen_model.generate(
@@ -604,9 +610,10 @@ Be specific and detailed for generating synthetic imagery."""
                 text=text_prompt,
                 return_tensors="pt"
             )
-            # Move inputs to the same device as model
+            # Move inputs to the same device and dtype as model
             device = next(self.gdino_model.parameters()).device
-            inputs = {k: v.to(device) if hasattr(v, 'to') else v for k, v in inputs.items()}
+            dtype = next(self.gdino_model.parameters()).dtype
+            inputs = {k: v.to(device=device, dtype=dtype) if hasattr(v, 'to') and v.is_floating_point() else (v.to(device) if hasattr(v, 'to') else v) for k, v in inputs.items()}
             
             with torch.no_grad():
                 outputs = self.gdino_model(**inputs)
@@ -709,9 +716,10 @@ Be specific and detailed for generating synthetic imagery."""
                 input_boxes=[input_boxes],
                 return_tensors="pt"
             )
-            # Move inputs to the same device as model
+            # Move inputs to the same device and dtype as model
             device = next(self.sam_model.parameters()).device
-            inputs = {k: v.to(device) if hasattr(v, 'to') else v for k, v in inputs.items()}
+            dtype = next(self.sam_model.parameters()).dtype
+            inputs = {k: v.to(device=device, dtype=dtype) if hasattr(v, 'to') and v.is_floating_point() else (v.to(device) if hasattr(v, 'to') else v) for k, v in inputs.items()}
             
             with torch.no_grad():
                 outputs = self.sam_model(**inputs)
