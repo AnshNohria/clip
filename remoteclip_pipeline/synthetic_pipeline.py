@@ -198,8 +198,17 @@ class SyntheticGenerationPipeline:
         self.metadata_dir.mkdir(parents=True, exist_ok=True)
     
     def setup(self):
-        """Setup method - alias for load_models()."""
-        self.load_models()
+        """Setup method - initialize but don't load all models at once."""
+        print("\n" + "="*80)
+        print("SYNTHETIC PIPELINE INITIALIZED (Lazy Loading Mode)")
+        print("="*80)
+        print("Models will be loaded on-demand to manage GPU memory.")
+        print(f"Available GPU memory: {self._get_actual_free_gpu_memory():.2f} GB")
+        print("="*80)
+        
+        # Initialize model references
+        self.esrgan_model = None
+        self._models_loaded = set()
     
     def _clear_gpu_memory(self):
         """Clear GPU memory cache."""
@@ -210,61 +219,85 @@ class SyntheticGenerationPipeline:
             gc.collect()
     
     def _get_free_gpu_memory(self) -> float:
-        """Get free GPU memory in GB."""
+        """Get free GPU memory in GB (PyTorch allocated view)."""
         if HAS_TORCH and torch.cuda.is_available():
             free_mem = torch.cuda.get_device_properties(0).total_memory - torch.cuda.memory_allocated(0)
             return free_mem / (1024**3)
         return 0.0
     
+    def _get_actual_free_gpu_memory(self) -> float:
+        """Get actual free GPU memory in GB (system view)."""
+        if HAS_TORCH and torch.cuda.is_available():
+            free_mem, total_mem = torch.cuda.mem_get_info(0)
+            return free_mem / (1024**3)
+        return 0.0
+    
+    def _unload_model(self, model_name: str):
+        """Unload a specific model from GPU to free memory."""
+        if model_name == "qwen" and self.qwen_model is not None:
+            del self.qwen_model
+            del self.qwen_processor
+            self.qwen_model = None
+            self.qwen_processor = None
+            self._models_loaded.discard("qwen")
+        elif model_name == "gdino" and self.gdino_model is not None:
+            del self.gdino_model
+            del self.gdino_processor
+            self.gdino_model = None
+            self.gdino_processor = None
+            self._models_loaded.discard("gdino")
+        elif model_name == "sam" and self.sam_model is not None:
+            del self.sam_model
+            del self.sam_processor
+            self.sam_model = None
+            self.sam_processor = None
+            self._models_loaded.discard("sam")
+        elif model_name == "sd" and self.sd_pipeline is not None:
+            del self.sd_pipeline
+            self.sd_pipeline = None
+            self._models_loaded.discard("sd")
+        elif model_name == "clip" and self.clip_model is not None:
+            del self.clip_model
+            del self.clip_preprocess
+            del self.clip_tokenizer
+            self.clip_model = None
+            self.clip_preprocess = None
+            self.clip_tokenizer = None
+            self._models_loaded.discard("clip")
+        
+        self._clear_gpu_memory()
+    
+    def _unload_all_except(self, keep: list):
+        """Unload all models except the specified ones."""
+        all_models = ["qwen", "gdino", "sam", "sd", "clip"]
+        for model in all_models:
+            if model not in keep:
+                self._unload_model(model)
+    
+    def _ensure_model_loaded(self, model_name: str):
+        """Ensure a specific model is loaded, loading it if necessary."""
+        if model_name == "qwen" and self.qwen_model is None:
+            self._load_qwen()
+        elif model_name == "gdino" and self.gdino_model is None:
+            self._load_grounding_dino()
+        elif model_name == "sam" and self.sam_model is None:
+            self._load_sam()
+        elif model_name == "sd" and self.sd_pipeline is None:
+            self._load_sd()
+        elif model_name == "clip" and self.clip_model is None:
+            self._load_clip()
+    
     def load_models(self):
-        """Load all required models to GPU."""
-        if not HAS_TORCH:
-            raise RuntimeError("PyTorch required for synthetic pipeline")
-        
-        print("\n" + "="*80)
-        print("LOADING MODELS FOR SYNTHETIC PIPELINE")
-        print("="*80)
-        
-        # Clear GPU memory first
-        self._clear_gpu_memory()
-        print(f"\nInitial free GPU memory: {self._get_free_gpu_memory():.2f} GB")
-        
-        # Real-ESRGAN removed - not needed for this pipeline
-        self.esrgan_model = None
-        
-        # Stage 2: Qwen2-VL (full 7B model)
-        print("\n[1/5] Loading Qwen2-VL-7B...")
-        self._clear_gpu_memory()
-        self._load_qwen()
-        
-        # Stage 3: Grounding DINO
-        print("\n[2/5] Loading Grounding DINO...")
-        self._clear_gpu_memory()
-        self._load_grounding_dino()
-        
-        # Stage 4: SAM (full huge model)
-        print("\n[3/5] Loading SAM-ViT-Huge...")
-        self._clear_gpu_memory()
-        self._load_sam()
-        
-        # Stage 6: SD 3.5
-        print("\n[4/5] Loading Stable Diffusion 3.5...")
-        self._clear_gpu_memory()
-        self._load_sd()
-        
-        # CLIP for scoring
-        print("\n[5/5] Loading CLIP for quality scoring...")
-        self._clear_gpu_memory()
-        self._load_clip()
-        
-        print(f"\nFinal free GPU memory: {self._get_free_gpu_memory():.2f} GB")
-        print("\nAll models loaded!")
-        print("="*80)
+        """Load all required models - kept for compatibility but uses lazy loading."""
+        # Just initialize, actual loading happens on-demand
+        pass
     
     def _load_qwen(self):
         """Load Qwen2-VL-7B model."""
         try:
             from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+            
+            print(f"  Loading Qwen2-VL-7B... (Free GPU: {self._get_actual_free_gpu_memory():.2f} GB)")
             
             self.qwen_model = Qwen2VLForConditionalGeneration.from_pretrained(
                 self.synthetic_config.qwen_model,
@@ -277,8 +310,8 @@ class SyntheticGenerationPipeline:
                 self.synthetic_config.qwen_model,
                 trust_remote_code=True
             )
-            print(f"  ✓ Qwen2-VL-7B loaded")
-            print(f"    Free GPU memory: {self._get_free_gpu_memory():.2f} GB")
+            self._models_loaded.add("qwen")
+            print(f"  ✓ Qwen2-VL-7B loaded (Free GPU: {self._get_actual_free_gpu_memory():.2f} GB)")
         except Exception as e:
             print(f"  ⚠ Qwen2-VL not available: {e}")
             self.qwen_model = None
@@ -289,16 +322,19 @@ class SyntheticGenerationPipeline:
         try:
             from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
             
+            print(f"  Loading Grounding DINO... (Free GPU: {self._get_actual_free_gpu_memory():.2f} GB)")
+            
             self.gdino_processor = AutoProcessor.from_pretrained(
                 self.synthetic_config.gdino_model
             )
             self.gdino_model = AutoModelForZeroShotObjectDetection.from_pretrained(
                 self.synthetic_config.gdino_model,
                 torch_dtype=torch.bfloat16,
+                device_map="auto",
                 low_cpu_mem_usage=True
-            ).to(self.device)
-            print("  ✓ Grounding DINO loaded")
-            print(f"    Free GPU memory: {self._get_free_gpu_memory():.2f} GB")
+            )
+            self._models_loaded.add("gdino")
+            print(f"  ✓ Grounding DINO loaded (Free GPU: {self._get_actual_free_gpu_memory():.2f} GB)")
         except Exception as e:
             print(f"  ⚠ Grounding DINO not available: {e}")
             self.gdino_model = None
@@ -309,16 +345,19 @@ class SyntheticGenerationPipeline:
         try:
             from transformers import SamModel, SamProcessor
             
+            print(f"  Loading SAM-ViT-Huge... (Free GPU: {self._get_actual_free_gpu_memory():.2f} GB)")
+            
             self.sam_model = SamModel.from_pretrained(
                 self.synthetic_config.sam_model,
                 torch_dtype=torch.bfloat16,
+                device_map="auto",
                 low_cpu_mem_usage=True
-            ).to(self.device)
+            )
             self.sam_processor = SamProcessor.from_pretrained(
                 self.synthetic_config.sam_model
             )
-            print(f"  ✓ SAM-ViT-Huge loaded")
-            print(f"    Free GPU memory: {self._get_free_gpu_memory():.2f} GB")
+            self._models_loaded.add("sam")
+            print(f"  ✓ SAM-ViT-Huge loaded (Free GPU: {self._get_actual_free_gpu_memory():.2f} GB)")
         except Exception as e:
             print(f"  ⚠ SAM not available: {e}")
             self.sam_model = None
@@ -329,18 +368,23 @@ class SyntheticGenerationPipeline:
         try:
             from diffusers import StableDiffusion3Pipeline
             
+            print(f"  Loading Stable Diffusion 3.5... (Free GPU: {self._get_actual_free_gpu_memory():.2f} GB)")
+            
             self.sd_pipeline = StableDiffusion3Pipeline.from_pretrained(
                 self.synthetic_config.sd_model,
                 torch_dtype=torch.bfloat16,
+                device_map="balanced",
                 low_cpu_mem_usage=True
-            ).to(self.device)
+            )
             
             # Enable memory optimizations
             self.sd_pipeline.enable_attention_slicing()
             if hasattr(self.sd_pipeline, 'enable_vae_slicing'):
                 self.sd_pipeline.enable_vae_slicing()
-            print("  ✓ Stable Diffusion 3.5 loaded")
-            print(f"    Free GPU memory: {self._get_free_gpu_memory():.2f} GB")
+            if hasattr(self.sd_pipeline, 'enable_model_cpu_offload'):
+                self.sd_pipeline.enable_model_cpu_offload()
+            self._models_loaded.add("sd")
+            print(f"  ✓ Stable Diffusion 3.5 loaded (Free GPU: {self._get_actual_free_gpu_memory():.2f} GB)")
         except Exception as e:
             print(f"  ⚠ Stable Diffusion 3.5 not available: {e}")
             self.sd_pipeline = None
@@ -350,16 +394,21 @@ class SyntheticGenerationPipeline:
         try:
             import open_clip
             
+            print(f"  Loading CLIP... (Free GPU: {self._get_actual_free_gpu_memory():.2f} GB)")
+            
             model, _, preprocess = open_clip.create_model_and_transforms(
                 'ViT-B-32', pretrained='openai'
             )
             self.clip_model = model.to(self.device).eval()
             self.clip_preprocess = preprocess
             self.clip_tokenizer = open_clip.get_tokenizer('ViT-B-32')
-            print("  ✓ CLIP loaded for quality scoring")
-        except ImportError:
-            print("  ⚠ CLIP not available for scoring")
+            self._models_loaded.add("clip")
+            print(f"  ✓ CLIP loaded (Free GPU: {self._get_actual_free_gpu_memory():.2f} GB)")
+        except Exception as e:
+            print(f"  ⚠ CLIP not available for scoring: {e}")
             self.clip_model = None
+            self.clip_preprocess = None
+            self.clip_tokenizer = None
     
     # =========================================================================
     # STAGE 2: Qwen2-VL Dense Scene Analysis
@@ -368,6 +417,10 @@ class SyntheticGenerationPipeline:
     def stage2_scene_analysis(self, image: Any) -> ExtractionResult:
         """Stage 2: Extract dense scene information using Qwen2-VL."""
         start_time = time.time()
+        
+        # Lazy load Qwen if not loaded, unload others to free memory
+        self._unload_all_except(["qwen"])
+        self._ensure_model_loaded("qwen")
         
         if self.qwen_model is None or self.qwen_processor is None:
             return self._fallback_extraction()
@@ -527,6 +580,10 @@ Be specific and detailed for generating synthetic imagery."""
         """Stage 3: Detect object positions using Grounding DINO."""
         start_time = time.time()
         
+        # Lazy load Grounding DINO, unload others
+        self._unload_all_except(["gdino"])
+        self._ensure_model_loaded("gdino")
+        
         if self.gdino_model is None or self.gdino_processor is None:
             return self._fallback_detection()
         
@@ -538,7 +595,10 @@ Be specific and detailed for generating synthetic imagery."""
                 images=image,
                 text=text_prompt,
                 return_tensors="pt"
-            ).to(self.device)
+            )
+            # Move inputs to the same device as model
+            device = next(self.gdino_model.parameters()).device
+            inputs = {k: v.to(device) if hasattr(v, 'to') else v for k, v in inputs.items()}
             
             with torch.no_grad():
                 outputs = self.gdino_model(**inputs)
@@ -546,7 +606,7 @@ Be specific and detailed for generating synthetic imagery."""
             # Process outputs
             results = self.gdino_processor.post_process_grounded_object_detection(
                 outputs,
-                inputs.input_ids,
+                inputs["input_ids"],
                 box_threshold=self.synthetic_config.gdino_box_threshold,
                 text_threshold=self.synthetic_config.gdino_text_threshold,
                 target_sizes=[image.size[::-1]]
@@ -574,7 +634,7 @@ Be specific and detailed for generating synthetic imagery."""
         return result
     
     def _compute_spatial_relationships(
-        self, 
+        self,
         boxes: List[List[float]], 
         labels: List[str]
     ) -> List[str]:
@@ -625,6 +685,10 @@ Be specific and detailed for generating synthetic imagery."""
         """Stage 4: Extract object shapes using SAM."""
         start_time = time.time()
         
+        # Lazy load SAM, unload others
+        self._unload_all_except(["sam"])
+        self._ensure_model_loaded("sam")
+        
         if self.sam_model is None or self.sam_processor is None:
             return self._fallback_segmentation()
         
@@ -636,7 +700,10 @@ Be specific and detailed for generating synthetic imagery."""
                 image,
                 input_boxes=[input_boxes],
                 return_tensors="pt"
-            ).to(self.device)
+            )
+            # Move inputs to the same device as model
+            device = next(self.sam_model.parameters()).device
+            inputs = {k: v.to(device) if hasattr(v, 'to') else v for k, v in inputs.items()}
             
             with torch.no_grad():
                 outputs = self.sam_model(**inputs)
@@ -753,6 +820,10 @@ Be specific and detailed for generating synthetic imagery."""
         """Stage 6: Generate synthetic image using Stable Diffusion 3.5."""
         start_time = time.time()
         
+        # Lazy load SD, unload others
+        self._unload_all_except(["sd"])
+        self._ensure_model_loaded("sd")
+        
         if self.sd_pipeline is None:
             return None, {"error": "SD pipeline not available"}
         
@@ -790,8 +861,7 @@ Be specific and detailed for generating synthetic imagery."""
     # =========================================================================
     # STAGES 7-9: Second-Pass Verification
     # =========================================================================
-    
-    def stage7_verify_scene(self, synthetic_image: Any) -> ExtractionResult:
+        def stage7_verify_scene(self, synthetic_image: Any) -> ExtractionResult:
         """Stage 7: Second-pass scene analysis on synthetic image."""
         start_time = time.time()
         result = self.stage2_scene_analysis(synthetic_image)
@@ -835,6 +905,10 @@ Be specific and detailed for generating synthetic imagery."""
     ) -> Tuple[str, QualityScores]:
         """Stage 10: Compute quality scores and generate refined caption."""
         start_time = time.time()
+        
+        # Lazy load CLIP for scoring, unload others
+        self._unload_all_except(["clip"])
+        self._ensure_model_loaded("clip")
         
         # Compute CLIP score
         clip_score = self._compute_clip_score(synthetic_image, original_prompt.full_prompt)
@@ -907,7 +981,7 @@ Be specific and detailed for generating synthetic imagery."""
     
     def _compute_layout_iou(
         self, 
-        original_boxes: List[List[float]], 
+        original_boxes: List[List[float]],
         synthetic_boxes: List[List[float]]
     ) -> float:
         """Compute average IoU between original and synthetic layouts."""

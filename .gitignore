@@ -13,7 +13,7 @@ clip-venv/
 venv/
 env/
 ENV/
-
+checkpoints/
 # IDE
 .vscode/
 .idea/
