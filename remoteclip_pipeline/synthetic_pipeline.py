@@ -1117,34 +1117,40 @@ class SyntheticGenerationPipeline:
             "samples": samples
         }
     
-    def generate_dataset(self, source_dir: Path, output_dir: Path, 
-                         target_count: Optional[int] = None) -> Dict[str, Any]:
+    def generate_dataset(self, source_images_dir: Path = None, output_dir: Path = None, 
+                         target_count: Optional[int] = None, source_dir: Path = None) -> Dict[str, Any]:
         """Generate synthetic dataset from source directory."""
+        # Support both parameter names for compatibility
+        source_path = source_images_dir or source_dir
+        if source_path is None:
+            raise ValueError("Must provide source_images_dir or source_dir")
+        
         if target_count:
             self.synthetic_config.target_synthetic_count = target_count
         
         # Collect images
         images = []
         for ext in ['*.jpg', '*.jpeg', '*.png', '*.bmp', '*.tif', '*.tiff']:
-            images.extend(source_dir.glob(ext))
-            images.extend(source_dir.glob(ext.upper()))
+            images.extend(source_path.glob(ext))
+            images.extend(source_path.glob(ext.upper()))
         
         if not images:
-            print(f"No images in {source_dir}")
-            return {"generated": 0}
+            print(f"No images in {source_path}")
+            return {"generated": 0, "samples": []}
         
         # Run
         result = self.run(images)
         
         # Save manifest
         manifest_path = self.metadata_dir / "dataset.json"
+        samples = result.get("samples", [])
         manifest = {
             "pairs": [{
                 "image_path": str(s.synthetic_image_path),
                 "caption": s.refined_caption,
                 "quality_scores": asdict(s.quality_scores),
                 "image_id": s.sample_id
-            } for s in result.get("samples", [])]
+            } for s in samples]
         }
         with open(manifest_path, 'w') as f:
             json.dump(manifest, f, indent=2)
@@ -1152,5 +1158,6 @@ class SyntheticGenerationPipeline:
         return {
             "generated": result.get("passed", 0),
             "quality_rate": result.get("quality_rate", 0.0),
-            "manifest_path": str(manifest_path)
+            "manifest_path": str(manifest_path),
+            "samples": samples  # Include samples for run_stage1.py compatibility
         }
