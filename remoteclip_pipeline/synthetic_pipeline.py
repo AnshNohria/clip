@@ -115,9 +115,10 @@ class SyntheticSample:
 
 class SyntheticGenerationPipeline:
     """
-    Synthetic Generation Pipeline with lazy model loading.
+    Synthetic Generation Pipeline with upfront model loading.
     
-    Models are loaded one at a time to manage GPU memory efficiently.
+    All models are loaded at initialization and kept in memory.
+    Uses CPU offloading when needed to manage GPU memory.
     """
     
     def __init__(self, config: PipelineConfig):
@@ -125,7 +126,7 @@ class SyntheticGenerationPipeline:
         self.synthetic_config = config.synthetic
         self.device = torch.device(config.device if torch.cuda.is_available() else "cpu")
         
-        # Model references (all start as None - lazy loaded)
+        # Model references (loaded during initialization)
         self.qwen_model = None
         self.qwen_processor = None
         self.gdino_model = None
@@ -149,6 +150,9 @@ class SyntheticGenerationPipeline:
         self.metadata_dir = self.output_root / "metadata"
         self.synthetic_dir.mkdir(parents=True, exist_ok=True)
         self.metadata_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Load all models upfront
+        self._load_all_models()
     
     # =========================================================================
     # GPU Memory Management
@@ -168,50 +172,40 @@ class SyntheticGenerationPipeline:
             return free / (1024**3)
         return 0.0
     
-    def _unload_all_models(self):
-        """Unload all models from GPU."""
-        if self.qwen_model is not None:
-            del self.qwen_model
-            del self.qwen_processor
-            self.qwen_model = None
-            self.qwen_processor = None
-        
-        if self.gdino_model is not None:
-            del self.gdino_model
-            del self.gdino_processor
-            self.gdino_model = None
-            self.gdino_processor = None
-        
-        if self.sam_model is not None:
-            del self.sam_model
-            del self.sam_processor
-            self.sam_model = None
-            self.sam_processor = None
-        
-        if self.sd_pipeline is not None:
-            del self.sd_pipeline
-            self.sd_pipeline = None
-        
-        if self.clip_model is not None:
-            del self.clip_model
-            del self.clip_preprocess
-            del self.clip_tokenizer
-            self.clip_model = None
-            self.clip_preprocess = None
-            self.clip_tokenizer = None
-        
-        self._clear_gpu_memory()
     
     # =========================================================================
-    # Model Loading (Lazy)
+    # Model Loading (Upfront)
     # =========================================================================
+    
+    def _load_all_models(self):
+        """Load all models at initialization."""
+        print("\nLoading models (this may take a few minutes)...")
+        
+        # Load Qwen2-VL
+        self._load_qwen()
+        
+        # Load Grounding DINO  
+        self._load_grounding_dino()
+        
+        # Load SAM
+        self._load_sam()
+        
+        # Load Stable Diffusion
+        self._load_stable_diffusion()
+        
+        # Load CLIP
+        self._load_clip()
+        
+        print(f"\n{'='*70}")
+        print("SYNTHETIC PIPELINE INITIALIZED")
+        print(f"{'='*70}")
+        print(f"Device: {self.device}")
+        print(f"Free GPU Memory: {self._get_free_memory():.1f} GB")
+        print("All models loaded and ready")
+        print(f"{'='*70}\n")
     
     def _load_qwen(self):
         """Load Qwen2-VL model."""
-        if self.qwen_model is not None:
-            return
-        
-        self._unload_all_models()
         print(f"  Loading Qwen2-VL... (Free: {self._get_free_memory():.1f}GB)")
         
         try:
@@ -231,15 +225,10 @@ class SyntheticGenerationPipeline:
             print(f"  ✓ Qwen2-VL loaded (Free: {self._get_free_memory():.1f}GB)")
         except Exception as e:
             print(f"  ✗ Qwen2-VL failed: {e}")
-            self.qwen_model = None
-            self.qwen_processor = None
+            raise
     
     def _load_grounding_dino(self):
         """Load Grounding DINO model."""
-        if self.gdino_model is not None:
-            return
-        
-        self._unload_all_models()
         print(f"  Loading Grounding DINO... (Free: {self._get_free_memory():.1f}GB)")
         
         try:
@@ -256,15 +245,10 @@ class SyntheticGenerationPipeline:
             print(f"  ✓ Grounding DINO loaded (Free: {self._get_free_memory():.1f}GB)")
         except Exception as e:
             print(f"  ✗ Grounding DINO failed: {e}")
-            self.gdino_model = None
-            self.gdino_processor = None
+            raise
     
     def _load_sam(self):
         """Load SAM model."""
-        if self.sam_model is not None:
-            return
-        
-        self._unload_all_models()
         print(f"  Loading SAM... (Free: {self._get_free_memory():.1f}GB)")
         
         try:
@@ -281,16 +265,10 @@ class SyntheticGenerationPipeline:
             print(f"  ✓ SAM loaded (Free: {self._get_free_memory():.1f}GB)")
         except Exception as e:
             print(f"  ✗ SAM failed: {e}")
-            self.sam_model = None
-            self.sam_processor = None
+            raise
     
     def _load_stable_diffusion(self):
         """Load Stable Diffusion with fallback chain."""
-        if self.sd_pipeline is not None:
-            return
-        
-        self._unload_all_models()
-        
         # Try SD 3.5 first
         try:
             from diffusers import StableDiffusion3Pipeline
@@ -343,12 +321,9 @@ class SyntheticGenerationPipeline:
             print(f"  ✗ All SD models failed: {e}")
             self.sd_pipeline = None
     
+    
     def _load_clip(self):
         """Load CLIP for quality scoring."""
-        if self.clip_model is not None:
-            return
-        
-        self._unload_all_models()
         print(f"  Loading CLIP... (Free: {self._get_free_memory():.1f}GB)")
         
         try:
@@ -364,7 +339,7 @@ class SyntheticGenerationPipeline:
             print(f"  ✓ CLIP loaded (Free: {self._get_free_memory():.1f}GB)")
         except Exception as e:
             print(f"  ✗ CLIP failed: {e}")
-            self.clip_model = None
+            raise
     
     # =========================================================================
     # Stage 2: Qwen2-VL Scene Analysis
@@ -374,7 +349,6 @@ class SyntheticGenerationPipeline:
         """Analyze image with Qwen2-VL to extract scene information."""
         start = time.time()
         
-        self._load_qwen()
         if self.qwen_model is None:
             return self._fallback_extraction()
         
@@ -513,7 +487,6 @@ class SyntheticGenerationPipeline:
         """Detect objects with Grounding DINO."""
         start = time.time()
         
-        self._load_grounding_dino()
         if self.gdino_model is None:
             return self._fallback_detection()
         
@@ -622,7 +595,6 @@ class SyntheticGenerationPipeline:
         """Segment objects with SAM."""
         start = time.time()
         
-        self._load_sam()
         if self.sam_model is None or not detection.boxes:
             return self._fallback_segmentation()
         
@@ -744,7 +716,6 @@ class SyntheticGenerationPipeline:
         """Generate image with Stable Diffusion."""
         start = time.time()
         
-        self._load_stable_diffusion()
         if self.sd_pipeline is None:
             return None, {"error": "SD not available"}
         
@@ -819,8 +790,6 @@ class SyntheticGenerationPipeline:
     ) -> Tuple[str, QualityScores]:
         """Compute quality scores and generate refined caption."""
         start = time.time()
-        
-        self._load_clip()
         
         # CLIP score
         clip_score = self._clip_score(image, prompt.full_prompt)
