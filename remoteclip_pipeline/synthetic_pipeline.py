@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import gc
 import json
+import os
 import time
 import uuid
 from pathlib import Path
@@ -30,9 +31,20 @@ from typing import Dict, List, Any, Optional, Tuple
 import warnings
 warnings.filterwarnings('ignore')
 
+# Limit CPU threads to prevent overload (2 cores available)
+os.environ['OMP_NUM_THREADS'] = '2'
+os.environ['MKL_NUM_THREADS'] = '2'
+os.environ['OPENBLAS_NUM_THREADS'] = '2'
+os.environ['VECLIB_MAXIMUM_THREADS'] = '2'
+os.environ['NUMEXPR_NUM_THREADS'] = '2'
+
 import torch
 import numpy as np
 from PIL import Image
+
+# Set torch threads
+torch.set_num_threads(2)
+torch.set_num_interop_threads(2)
 
 from .config import PipelineConfig
 
@@ -237,12 +249,12 @@ class SyntheticGenerationPipeline:
             self.gdino_processor = AutoProcessor.from_pretrained(
                 self.synthetic_config.gdino_model
             )
+            # Keep on GPU - moderate size, needs fast inference
             self.gdino_model = AutoModelForZeroShotObjectDetection.from_pretrained(
                 self.synthetic_config.gdino_model,
-                torch_dtype=torch.float32,  # DINO works better with float32
-                device_map="auto",  # Auto CPU offloading
+                torch_dtype=torch.float16,  # Use float16 to save memory
                 low_cpu_mem_usage=True
-            ).eval()
+            ).to(self.device).eval()
             
             print(f"  ✓ Grounding DINO loaded (Free: {self._get_free_memory():.1f}GB)")
         except Exception as e:
@@ -253,18 +265,23 @@ class SyntheticGenerationPipeline:
         """Load SAM model."""
         print(f"  Loading SAM... (Free: {self._get_free_memory():.1f}GB)")
         
+        # Clear cache before loading SAM
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            gc.collect()
+        
         try:
             from transformers import SamModel, SamProcessor
             
             self.sam_processor = SamProcessor.from_pretrained(
                 self.synthetic_config.sam_model
             )
+            # Keep on GPU with float16 for memory efficiency
             self.sam_model = SamModel.from_pretrained(
                 self.synthetic_config.sam_model,
-                torch_dtype=torch.float32,  # SAM works better with float32
-                device_map="auto",  # Auto CPU offloading
+                torch_dtype=torch.float16,  # Use float16 to save memory
                 low_cpu_mem_usage=True
-            ).eval()
+            ).to(self.device).eval()
             
             print(f"  ✓ SAM loaded (Free: {self._get_free_memory():.1f}GB)")
         except Exception as e:
@@ -283,9 +300,11 @@ class SyntheticGenerationPipeline:
                 torch_dtype=torch.float16,
                 variant="fp16"
             )
-            # Enable CPU offloading for SD
-            self.sd_pipeline.enable_model_cpu_offload()
+            # Use sequential offload - more memory efficient, less CPU intensive
+            self.sd_pipeline.enable_sequential_cpu_offload()
             self.sd_pipeline.enable_attention_slicing()
+            # Enable memory efficient attention
+            self.sd_pipeline.enable_vae_slicing()
             
             print(f"  ✓ SD 3.5 loaded (Free: {self._get_free_memory():.1f}GB)")
             return
@@ -303,9 +322,10 @@ class SyntheticGenerationPipeline:
                 variant="fp16",
                 use_safetensors=True
             )
-            # Enable CPU offloading for SDXL
-            self.sd_pipeline.enable_model_cpu_offload()
+            # Use sequential offload - more memory efficient, less CPU intensive
+            self.sd_pipeline.enable_sequential_cpu_offload()
             self.sd_pipeline.enable_attention_slicing()
+            self.sd_pipeline.enable_vae_slicing()
             
             print(f"  ✓ SDXL loaded (Free: {self._get_free_memory():.1f}GB)")
             return
@@ -321,8 +341,8 @@ class SyntheticGenerationPipeline:
                 "stabilityai/stable-diffusion-2-1",
                 torch_dtype=torch.float16
             )
-            # Enable CPU offloading for SD 2.1
-            self.sd_pipeline.enable_model_cpu_offload()
+            # Use sequential offload - more memory efficient, less CPU intensive
+            self.sd_pipeline.enable_sequential_cpu_offload()
             self.sd_pipeline.enable_attention_slicing()
             
             print(f"  ✓ SD 2.1 loaded (Free: {self._get_free_memory():.1f}GB)")
