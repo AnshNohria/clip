@@ -80,16 +80,11 @@ models = [
         "id": "stabilityai/stable-diffusion-3.5-medium",
         "type": "diffusers",
         "class": "StableDiffusion3Pipeline"
-    },
-    {
-        "name": "CLIP ViT-B-32",
-        "id": "openai",
-        "type": "open_clip",
-        "class": "ViT-B-32"
     }
 ]
 
 print(f"Will download {len(models)} models sequentially")
+print("(CLIP removed - quality scoring disabled for LoRA training)")
 print()
 print("NOTE: SD 3.5 is GATED - you must accept license first:")
 print("  https://huggingface.co/stabilityai/stable-diffusion-3.5-medium")
@@ -169,16 +164,6 @@ for i, model in enumerate(models, 1):
                 cache_dir=cache_dir
             )
             del pipeline
-        
-        elif model['type'] == 'open_clip':
-            import open_clip
-            print(f"Downloading OpenCLIP: {model['class']} from {model['id']}")
-            mdl, _, preprocess = open_clip.create_model_and_transforms(
-                model['class'], 
-                pretrained=model['id']
-            )
-            tokenizer = open_clip.get_tokenizer(model['class'])
-            del mdl, preprocess, tokenizer
         
         print(f"✓ {model['name']} downloaded successfully!")
         

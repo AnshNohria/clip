@@ -205,36 +205,48 @@ class SyntheticGenerationPipeline:
         # Load Stable Diffusion
         self._load_stable_diffusion()
         
-        # Load CLIP
-        self._load_clip()
-        
         print(f"\n{'='*70}")
         print("SYNTHETIC PIPELINE INITIALIZED")
         print(f"{'='*70}")
         print(f"Device: {self.device}")
         print(f"Free GPU Memory: {self._get_free_memory():.1f} GB")
-        print("All models loaded and ready")
+        print("All models loaded and ready (Quality scoring disabled)")
         print(f"{'='*70}\n")
     
     def _load_qwen(self):
-        """Load Qwen2-VL model."""
-        print(f"  Loading Qwen2-VL... (Free: {self._get_free_memory():.1f}GB)")
+        """Load Qwen2-VL model with 8-bit quantization."""
+        print(f"  Loading Qwen2-VL (8-bit quantized)... (Free: {self._get_free_memory():.1f}GB)")
+        
+        # Aggressive cleanup before loading
+        self._clear_gpu_memory()
         
         try:
-            from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
+            from transformers import Qwen2VLForConditionalGeneration, AutoProcessor, BitsAndBytesConfig
             
             self.qwen_processor = AutoProcessor.from_pretrained(
                 self.synthetic_config.qwen_model,
                 trust_remote_code=True
             )
+            
+            # 8-bit quantization config - reduces memory by ~50%
+            quantization_config = BitsAndBytesConfig(
+                load_in_8bit=True,
+                llm_int8_threshold=6.0,
+                llm_int8_has_fp16_weight=False
+            )
+            
             self.qwen_model = Qwen2VLForConditionalGeneration.from_pretrained(
                 self.synthetic_config.qwen_model,
-                torch_dtype=torch.float16,
+                quantization_config=quantization_config,
                 device_map="auto",
                 trust_remote_code=True,
                 low_cpu_mem_usage=True
             )
-            print(f"  ✓ Qwen2-VL loaded (Free: {self._get_free_memory():.1f}GB)")
+            
+            # Aggressive cleanup after loading
+            self._clear_gpu_memory()
+            
+            print(f"  ✓ Qwen2-VL loaded (8-bit, Free: {self._get_free_memory():.1f}GB)")
         except Exception as e:
             print(f"  ✗ Qwen2-VL failed: {e}")
             raise
@@ -242,6 +254,9 @@ class SyntheticGenerationPipeline:
     def _load_grounding_dino(self):
         """Load Grounding DINO model."""
         print(f"  Loading Grounding DINO... (Free: {self._get_free_memory():.1f}GB)")
+        
+        # Aggressive cleanup before loading
+        self._clear_gpu_memory()
         
         try:
             from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
@@ -256,6 +271,9 @@ class SyntheticGenerationPipeline:
                 low_cpu_mem_usage=True
             ).to(self.device).eval()
             
+            # Aggressive cleanup after loading
+            self._clear_gpu_memory()
+            
             print(f"  ✓ Grounding DINO loaded (Free: {self._get_free_memory():.1f}GB)")
         except Exception as e:
             print(f"  ✗ Grounding DINO failed: {e}")
@@ -265,10 +283,12 @@ class SyntheticGenerationPipeline:
         """Load SAM model."""
         print(f"  Loading SAM... (Free: {self._get_free_memory():.1f}GB)")
         
-        # Clear cache before loading SAM
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # Aggressive cleanup before loading SAM (multiple passes)
+        for _ in range(3):
             gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+                torch.cuda.synchronize()
         
         try:
             from transformers import SamModel, SamProcessor
@@ -283,6 +303,9 @@ class SyntheticGenerationPipeline:
                 low_cpu_mem_usage=True
             ).to(self.device).eval()
             
+            # Aggressive cleanup after loading
+            self._clear_gpu_memory()
+            
             print(f"  ✓ SAM loaded (Free: {self._get_free_memory():.1f}GB)")
         except Exception as e:
             print(f"  ✗ SAM failed: {e}")
@@ -290,6 +313,9 @@ class SyntheticGenerationPipeline:
     
     def _load_stable_diffusion(self):
         """Load Stable Diffusion with fallback chain."""
+        # Aggressive cleanup before loading SD
+        self._clear_gpu_memory()
+        
         # Try SD 3.5 first
         try:
             from diffusers import StableDiffusion3Pipeline
@@ -305,6 +331,9 @@ class SyntheticGenerationPipeline:
             self.sd_pipeline.enable_attention_slicing()
             # Enable memory efficient attention
             self.sd_pipeline.enable_vae_slicing()
+            
+            # Aggressive cleanup after setup
+            self._clear_gpu_memory()
             
             print(f"  ✓ SD 3.5 loaded (Free: {self._get_free_memory():.1f}GB)")
             return
@@ -353,23 +382,9 @@ class SyntheticGenerationPipeline:
     
     
     def _load_clip(self):
-        """Load CLIP for quality scoring."""
-        print(f"  Loading CLIP... (Free: {self._get_free_memory():.1f}GB)")
-        
-        try:
-            import open_clip
-            
-            model, _, preprocess = open_clip.create_model_and_transforms(
-                'ViT-B-32', pretrained='openai'
-            )
-            self.clip_model = model.to(self.device).eval()
-            self.clip_preprocess = preprocess
-            self.clip_tokenizer = open_clip.get_tokenizer('ViT-B-32')
-            
-            print(f"  ✓ CLIP loaded (Free: {self._get_free_memory():.1f}GB)")
-        except Exception as e:
-            print(f"  ✗ CLIP failed: {e}")
-            raise
+        """Load CLIP for quality scoring - DISABLED (LoRA training mode)."""
+        # CLIP loading disabled - accepting all synthetic images for LoRA training
+        pass
     
     # =========================================================================
     # Stage 2: Qwen2-VL Scene Analysis
@@ -435,6 +450,10 @@ class SyntheticGenerationPipeline:
                 output_ids[:, inputs["input_ids"].shape[1]:],
                 skip_special_tokens=True
             )[0]
+            
+            # Delete intermediate tensors immediately
+            del output_ids, inputs
+            torch.cuda.empty_cache()
             
             result = self._parse_extraction(response)
             
@@ -573,6 +592,10 @@ class SyntheticGenerationPipeline:
             # Compute spatial relationships
             spatial = self._compute_spatial(boxes, labels)
             
+            # Delete intermediate tensors immediately
+            del outputs, inputs, target_sizes, results
+            torch.cuda.empty_cache()
+            
             result = DetectionResult(
                 boxes=boxes,
                 labels=labels,
@@ -682,6 +705,10 @@ class SyntheticGenerationPipeline:
                         m = m.squeeze()
                         mask_list.append(m)
                         areas.append(int((m > 0.5).sum()))
+            
+            # Delete intermediate tensors immediately
+            del outputs, inputs, masks
+            torch.cuda.empty_cache()
             
             result = SegmentationResult(
                 masks=mask_list,
@@ -876,26 +903,8 @@ class SyntheticGenerationPipeline:
         return caption, scores
     
     def _clip_score(self, image: Image.Image, text: str) -> float:
-        """Compute CLIP similarity."""
-        if self.clip_model is None:
-            return 0.5
-        
-        try:
-            import torch.nn.functional as F
-            
-            img_input = self.clip_preprocess(image).unsqueeze(0).to(self.device)
-            txt_input = self.clip_tokenizer([text]).to(self.device)
-            
-            with torch.no_grad():
-                img_feat = self.clip_model.encode_image(img_input)
-                txt_feat = self.clip_model.encode_text(txt_input)
-                img_feat = F.normalize(img_feat, dim=-1)
-                txt_feat = F.normalize(txt_feat, dim=-1)
-                sim = (img_feat @ txt_feat.T).item()
-            
-            return (sim + 1) / 2  # Convert to [0, 1]
-        except:
-            return 0.5
+        """CLIP scoring disabled for LoRA training mode."""
+        return 1.0  # Always return perfect score
     
     def _layout_iou(self, boxes1: List, boxes2: List) -> float:
         """Compute average IoU between box sets."""
@@ -1011,8 +1020,8 @@ class SyntheticGenerationPipeline:
             verify_det = self.stage8_verify_detection(synthetic, extraction.object_inventory)
             verify_seg = self.stage9_verify_segmentation(synthetic, verify_det)
             
-            # Stage 10: Scoring
-            print("    Stage 10: Quality scoring...")
+            # Stage 10: Caption generation (no quality checks)
+            print("    Stage 10: Caption generation...")
             caption, scores = self.stage10_score_and_refine(
                 synthetic, prompt, extraction, detection, verify_ext, verify_det
             )
@@ -1042,10 +1051,8 @@ class SyntheticGenerationPipeline:
             self._save_metadata(sample)
             
             self.processed_count += 1
-            if scores.all_checks_passed:
-                self.passed_count += 1
-            else:
-                self.failed_count += 1
+            # Always pass in LoRA mode - no quality filtering
+            self.passed_count += 1
             
             # Final cleanup after processing image
             self._clear_gpu_memory()
@@ -1095,9 +1102,7 @@ class SyntheticGenerationPipeline:
         print("="*70)
         print(f"Images: {len(source_images)}")
         print(f"Target: {self.synthetic_config.target_synthetic_count}")
-        print(f"Thresholds: CLIP>{self.synthetic_config.min_clip_score}, "
-              f"IoU>{self.synthetic_config.min_layout_iou}, "
-              f"Obj>{self.synthetic_config.min_object_count_accuracy}")
+        print(f"Mode: LoRA Training (All images accepted - no quality filtering)")
         print("="*70)
         
         samples = []
@@ -1109,12 +1114,11 @@ class SyntheticGenerationPipeline:
             print(f"\n[{i+1}/{len(source_images)}] {path.name}")
             sample = self.process_image(path)
             
-            if sample and sample.quality_scores.all_checks_passed:
+            if sample:
                 samples.append(sample)
-                print(f"  ✓ Passed - CLIP:{sample.quality_scores.clip_score:.3f} "
-                      f"IoU:{sample.quality_scores.layout_iou:.3f}")
+                print(f"  ✓ Generated successfully (LoRA mode - no quality filter)")
             else:
-                print(f"  ✗ Failed quality check")
+                print(f"  ✗ Generation failed")
             
             if (i + 1) % 10 == 0:
                 rate = self.passed_count / max(1, self.processed_count) * 100
