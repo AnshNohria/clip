@@ -443,6 +443,10 @@ class SyntheticGenerationPipeline:
             result = self._fallback_extraction()
         
         self.stage_times["stage_2"].append(time.time() - start)
+        
+        # Cleanup GPU memory after stage
+        self._clear_gpu_memory()
+        
         return result
     
     def _parse_extraction(self, response: str) -> ExtractionResult:
@@ -583,6 +587,10 @@ class SyntheticGenerationPipeline:
             result = self._fallback_detection()
         
         self.stage_times["stage_3"].append(time.time() - start)
+        
+        # Cleanup GPU memory after stage
+        self._clear_gpu_memory()
+        
         return result
     
     def _compute_spatial(self, boxes: List, labels: List) -> List[str]:
@@ -686,6 +694,10 @@ class SyntheticGenerationPipeline:
             result = self._fallback_segmentation()
         
         self.stage_times["stage_4"].append(time.time() - start)
+        
+        # Cleanup GPU memory after stage
+        self._clear_gpu_memory()
+        
         return result
     
     def _fallback_segmentation(self) -> SegmentationResult:
@@ -778,6 +790,10 @@ class SyntheticGenerationPipeline:
             params = {"error": str(e), "success": False}
         
         self.stage_times["stage_6"].append(time.time() - start)
+        
+        # Cleanup GPU memory after stage
+        self._clear_gpu_memory()
+        
         return image, params
     
     # =========================================================================
@@ -853,6 +869,10 @@ class SyntheticGenerationPipeline:
         caption = self._generate_caption(verify_ext, verify_det)
         
         self.stage_times["stage_10"].append(time.time() - start)
+        
+        # Cleanup GPU memory after stage
+        self._clear_gpu_memory()
+        
         return caption, scores
     
     def _clip_score(self, image: Image.Image, text: str) -> float:
@@ -1027,6 +1047,9 @@ class SyntheticGenerationPipeline:
             else:
                 self.failed_count += 1
             
+            # Final cleanup after processing image
+            self._clear_gpu_memory()
+            
             return sample
             
         except Exception as e:
@@ -1034,6 +1057,10 @@ class SyntheticGenerationPipeline:
             import traceback
             traceback.print_exc()
             self.failed_count += 1
+            
+            # Cleanup even on error
+            self._clear_gpu_memory()
+            
             return None
     
     # Alias for compatibility
