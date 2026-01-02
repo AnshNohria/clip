@@ -14,12 +14,26 @@ from dotenv import load_dotenv
 # Load environment
 load_dotenv()
 
+# Login to HuggingFace
+hf_token = os.getenv('HF_TOKEN')
+if not hf_token:
+    print("ERROR: HF_TOKEN not found in .env file")
+    sys.exit(1)
+
+try:
+    from huggingface_hub import login
+    login(token=hf_token)
+    print("✓ Logged in to HuggingFace")
+except Exception as e:
+    print(f"ERROR: Failed to login to HuggingFace: {e}")
+    sys.exit(1)
+
 # Check CUDA
 if not torch.cuda.is_available():
     print("ERROR: CUDA not available")
     sys.exit(1)
 
-print("="*70)
+print("\n" + "="*70)
 print("MODEL DOWNLOADER - ALL PIPELINE MODELS")
 print("="*70)
 
@@ -75,7 +89,11 @@ models = [
     }
 ]
 
-print(f"Will download {len(models)} models sequentially\n")
+print(f"Will download {len(models)} models sequentially")
+print()
+print("NOTE: SD 3.5 is GATED - you must accept license first:")
+print("  https://huggingface.co/stabilityai/stable-diffusion-3.5-medium")
+print()
 
 for i, model in enumerate(models, 1):
     print("="*70)
