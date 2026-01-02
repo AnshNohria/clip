@@ -239,8 +239,10 @@ class SyntheticGenerationPipeline:
             )
             self.gdino_model = AutoModelForZeroShotObjectDetection.from_pretrained(
                 self.synthetic_config.gdino_model,
-                torch_dtype=torch.float32  # DINO works better with float32
-            ).to(self.device).eval()
+                torch_dtype=torch.float32,  # DINO works better with float32
+                device_map="auto",  # Auto CPU offloading
+                low_cpu_mem_usage=True
+            ).eval()
             
             print(f"  ✓ Grounding DINO loaded (Free: {self._get_free_memory():.1f}GB)")
         except Exception as e:
@@ -259,8 +261,10 @@ class SyntheticGenerationPipeline:
             )
             self.sam_model = SamModel.from_pretrained(
                 self.synthetic_config.sam_model,
-                torch_dtype=torch.float32  # SAM works better with float32
-            ).to(self.device).eval()
+                torch_dtype=torch.float32,  # SAM works better with float32
+                device_map="auto",  # Auto CPU offloading
+                low_cpu_mem_usage=True
+            ).eval()
             
             print(f"  ✓ SAM loaded (Free: {self._get_free_memory():.1f}GB)")
         except Exception as e:
@@ -278,7 +282,9 @@ class SyntheticGenerationPipeline:
                 self.synthetic_config.sd_model,
                 torch_dtype=torch.float16,
                 variant="fp16"
-            ).to(self.device)
+            )
+            # Enable CPU offloading for SD
+            self.sd_pipeline.enable_model_cpu_offload()
             self.sd_pipeline.enable_attention_slicing()
             
             print(f"  ✓ SD 3.5 loaded (Free: {self._get_free_memory():.1f}GB)")
@@ -296,7 +302,9 @@ class SyntheticGenerationPipeline:
                 torch_dtype=torch.float16,
                 variant="fp16",
                 use_safetensors=True
-            ).to(self.device)
+            )
+            # Enable CPU offloading for SDXL
+            self.sd_pipeline.enable_model_cpu_offload()
             self.sd_pipeline.enable_attention_slicing()
             
             print(f"  ✓ SDXL loaded (Free: {self._get_free_memory():.1f}GB)")
@@ -312,7 +320,9 @@ class SyntheticGenerationPipeline:
             self.sd_pipeline = StableDiffusionPipeline.from_pretrained(
                 "stabilityai/stable-diffusion-2-1",
                 torch_dtype=torch.float16
-            ).to(self.device)
+            )
+            # Enable CPU offloading for SD 2.1
+            self.sd_pipeline.enable_model_cpu_offload()
             self.sd_pipeline.enable_attention_slicing()
             
             print(f"  ✓ SD 2.1 loaded (Free: {self._get_free_memory():.1f}GB)")
