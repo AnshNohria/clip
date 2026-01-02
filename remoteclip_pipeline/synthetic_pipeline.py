@@ -214,8 +214,8 @@ class SyntheticGenerationPipeline:
         print(f"{'='*70}\n")
     
     def _load_qwen(self):
-        """Load Qwen2-VL model with 8-bit quantization."""
-        print(f"  Loading Qwen2-VL (8-bit quantized)... (Free: {self._get_free_memory():.1f}GB)")
+        """Load Qwen2-VL-2B model with 8-bit quantization."""
+        print(f"  Loading Qwen2-VL-2B (8-bit quantized)... (Free: {self._get_free_memory():.1f}GB)")
         
         # Aggressive cleanup before loading
         self._clear_gpu_memory()
@@ -246,9 +246,9 @@ class SyntheticGenerationPipeline:
             # Aggressive cleanup after loading
             self._clear_gpu_memory()
             
-            print(f"  ✓ Qwen2-VL loaded (8-bit, Free: {self._get_free_memory():.1f}GB)")
+            print(f"  ✓ Qwen2-VL-2B loaded (8-bit, Free: {self._get_free_memory():.1f}GB)")
         except Exception as e:
-            print(f"  ✗ Qwen2-VL failed: {e}")
+            print(f"  ✗ Qwen2-VL-2B failed: {e}")
             raise
     
     def _load_grounding_dino(self):

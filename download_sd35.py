@@ -46,10 +46,17 @@ if free_gb < 8:
     if response.lower() != 'y':
         sys.exit(0)
 
-# Get cache directory
-cache_dir = os.getenv('HF_HOME', 'checkpoints/huggingface')
+# Get cache directory - use absolute path
+cache_dir = os.getenv('HF_HOME')
+if not cache_dir:
+    # Default to absolute path in project
+    cache_dir = str(Path.cwd() / 'checkpoints' / 'huggingface')
+
 cache_path = Path(cache_dir).resolve()
 print(f"Cache directory: {cache_path}")
+
+# Create cache directory if it doesn't exist
+cache_path.mkdir(parents=True, exist_ok=True)
 print()
 
 # Model to download

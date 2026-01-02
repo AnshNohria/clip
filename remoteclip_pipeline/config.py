@@ -19,7 +19,7 @@ class SyntheticConfig:
     esrgan_model: str = "realesrgan-x4plus"
     
     # Qwen2-VL settings
-    qwen_model: str = "Qwen/Qwen2-VL-7B-Instruct"
+    qwen_model: str = "Qwen/Qwen2-VL-2B-Instruct"  # 2B model for memory efficiency
     qwen_max_tokens: int = 512
     
     # Grounding DINO settings

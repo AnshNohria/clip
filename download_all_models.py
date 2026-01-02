@@ -37,10 +37,17 @@ print("\n" + "="*70)
 print("MODEL DOWNLOADER - ALL PIPELINE MODELS")
 print("="*70)
 
-# Get cache directory
-cache_dir = os.getenv('HF_HOME', 'checkpoints/huggingface')
+# Get cache directory - use absolute path
+cache_dir = os.getenv('HF_HOME')
+if not cache_dir:
+    # Default to absolute path in project
+    cache_dir = str(Path.cwd() / 'checkpoints' / 'huggingface')
+
 cache_path = Path(cache_dir).resolve()
 print(f"Cache directory: {cache_path}")
+
+# Create cache directory if it doesn't exist
+cache_path.mkdir(parents=True, exist_ok=True)
 print()
 
 def get_free_memory():
@@ -58,8 +65,8 @@ def clear_memory():
 # Models to download
 models = [
     {
-        "name": "Qwen2-VL-7B-Instruct",
-        "id": "Qwen/Qwen2-VL-7B-Instruct",
+        "name": "Qwen2-VL-2B-Instruct",
+        "id": "Qwen/Qwen2-VL-2B-Instruct",
         "type": "transformers",
         "class": "Qwen2VLForConditionalGeneration"
     },
