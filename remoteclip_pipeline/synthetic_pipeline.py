@@ -264,10 +264,10 @@ class SyntheticGenerationPipeline:
             self.gdino_processor = AutoProcessor.from_pretrained(
                 self.synthetic_config.gdino_model
             )
-            # Keep on GPU - moderate size, needs fast inference
+            # Keep on GPU - use float32 for stable inference (matches working code)
             self.gdino_model = AutoModelForZeroShotObjectDetection.from_pretrained(
                 self.synthetic_config.gdino_model,
-                torch_dtype=torch.float16,  # Use float16 to save memory
+                torch_dtype=torch.float32,
                 low_cpu_mem_usage=True
             ).to(self.device).eval()
             
@@ -296,10 +296,10 @@ class SyntheticGenerationPipeline:
             self.sam_processor = SamProcessor.from_pretrained(
                 self.synthetic_config.sam_model
             )
-            # Keep on GPU with float16 for memory efficiency
+            # Keep on GPU with float32 for compatibility (matches working code)
             self.sam_model = SamModel.from_pretrained(
                 self.synthetic_config.sam_model,
-                torch_dtype=torch.float16,  # Use float16 to save memory
+                torch_dtype=torch.float32,
                 low_cpu_mem_usage=True
             ).to(self.device).eval()
             
@@ -509,32 +509,22 @@ class SyntheticGenerationPipeline:
             # Build text prompt
             text_prompt = ". ".join(objects.keys()) + "."
             
-            # Process inputs
+            # Process inputs - move to device (float32 model, no conversion needed)
             inputs = self.gdino_processor(
                 images=image,
                 text=text_prompt,
                 return_tensors="pt"
-            )
-            
-            # Convert to float16 to match model dtype
-            inputs_converted = {}
-            for k, v in inputs.items():
-                if hasattr(v, 'dtype') and v.dtype.is_floating_point:
-                    # Convert all floating point types to float16
-                    inputs_converted[k] = v.to(self.device, dtype=torch.float16)
-                else:
-                    # Keep integer types (like input_ids) as-is
-                    inputs_converted[k] = v.to(self.device)
+            ).to(self.device)
             
             # Run model
             with torch.no_grad():
-                outputs = self.gdino_model(**inputs_converted)
+                outputs = self.gdino_model(**inputs)
             
             # Post-process - get raw results first
             target_sizes = torch.tensor([image.size[::-1]], device=self.device)
             results = self.gdino_processor.post_process_grounded_object_detection(
                 outputs,
-                inputs_converted['input_ids'],
+                inputs.input_ids,
                 target_sizes=target_sizes
             )[0]
             
@@ -565,7 +555,7 @@ class SyntheticGenerationPipeline:
             spatial = self._compute_spatial(boxes, labels)
             
             # Delete intermediate tensors immediately
-            del outputs, inputs_converted, target_sizes, results
+            del outputs, inputs, target_sizes, results
             torch.cuda.empty_cache()
             
             result = DetectionResult(
@@ -635,22 +625,17 @@ class SyntheticGenerationPipeline:
             # Prepare boxes (limit to 10)
             input_boxes = detection.boxes[:10]
             
-            # Process inputs
+            # Process inputs - move to device (float32 model, no conversion needed)
             inputs = self.sam_processor(
                 image,
                 input_boxes=[input_boxes],
                 return_tensors="pt"
             )
             
-            # Move to device and convert to float16 to match model dtype
+            # Move to device
             for k, v in inputs.items():
                 if hasattr(v, 'to'):
-                    if hasattr(v, 'dtype') and v.dtype.is_floating_point:
-                        # Convert all floating point types to float16
-                        inputs[k] = v.to(self.device, dtype=torch.float16)
-                    else:
-                        # Keep integer types as-is
-                        inputs[k] = v.to(self.device)
+                    inputs[k] = v.to(self.device)
             
             # Run model
             with torch.no_grad():
