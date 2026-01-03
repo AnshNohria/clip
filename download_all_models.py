@@ -39,9 +39,18 @@ print("="*70)
 
 # Get cache directory - use absolute path
 cache_dir = os.getenv('HF_HOME')
+if cache_dir:
+    # Remove Windows-style paths if present (D:/ or C:/ etc)
+    cache_dir = cache_dir.replace('\\', '/')
+    if ':' in cache_dir and cache_dir[1] == ':':
+        # Windows path detected, use default instead
+        print(f"WARNING: Windows path detected in HF_HOME: {cache_dir}")
+        cache_dir = None
+
 if not cache_dir:
-    # Default to absolute path in project
-    cache_dir = str(Path.cwd() / 'checkpoints' / 'huggingface')
+    # Always use absolute path relative to script location
+    script_dir = Path(__file__).parent.resolve()
+    cache_dir = str(script_dir / 'checkpoints' / 'huggingface')
 
 cache_path = Path(cache_dir).resolve()
 print(f"Cache directory: {cache_path}")

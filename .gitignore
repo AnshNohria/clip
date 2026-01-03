@@ -23,7 +23,7 @@ checkpoints/
 # Environment variables
 .env
 .env.local
-
+.env.server
 # Model Cache
 hf_cache/
 llava_cache/
