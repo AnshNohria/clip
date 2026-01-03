@@ -519,9 +519,11 @@ class SyntheticGenerationPipeline:
             # Convert to float16 to match model dtype
             inputs_converted = {}
             for k, v in inputs.items():
-                if v.dtype == torch.float32:
-                    inputs_converted[k] = v.to(self.device).to(torch.float16)
+                if hasattr(v, 'dtype') and v.dtype.is_floating_point:
+                    # Convert all floating point types to float16
+                    inputs_converted[k] = v.to(self.device, dtype=torch.float16)
                 else:
+                    # Keep integer types (like input_ids) as-is
                     inputs_converted[k] = v.to(self.device)
             
             # Run model
@@ -643,9 +645,11 @@ class SyntheticGenerationPipeline:
             # Move to device and convert to float16 to match model dtype
             for k, v in inputs.items():
                 if hasattr(v, 'to'):
-                    if v.dtype == torch.float32:
-                        inputs[k] = v.to(self.device).to(torch.float16)
+                    if hasattr(v, 'dtype') and v.dtype.is_floating_point:
+                        # Convert all floating point types to float16
+                        inputs[k] = v.to(self.device, dtype=torch.float16)
                     else:
+                        # Keep integer types as-is
                         inputs[k] = v.to(self.device)
             
             # Run model
@@ -731,7 +735,8 @@ class SyntheticGenerationPipeline:
         objects = f"containing {obj_text}"
         style = f"{extraction.appearance_details}, {extraction.lighting_conditions}"
         
-        # Full prompt
+        # Full prompt - detailed for better generation quality
+        # Note: SD3's CLIP tokenizer will truncate to 77 tokens automatically if needed
         full = (
             f"High-resolution {scene} {objects}. "
             f"{layout} "
