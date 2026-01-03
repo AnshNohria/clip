@@ -34,7 +34,7 @@ class SyntheticConfig:
     sam_checkpoint: Optional[str] = None
     
     # SD 3.5 settings
-    sd_model: str = "stabilityai/stable-diffusion-3.5-large"
+    sd_model: str = "stabilityai/stable-diffusion-3.5-medium"
     sd_steps: int = 50
     sd_guidance_scale: float = 7.5
     sd_controlnet_scale: float = 0.8

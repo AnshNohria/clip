@@ -312,14 +312,13 @@ class SyntheticGenerationPipeline:
             raise
     
     def _load_stable_diffusion(self):
-        """Load Stable Diffusion with fallback chain."""
+        """Load Stable Diffusion 3.5 Medium."""
         # Aggressive cleanup before loading SD
         self._clear_gpu_memory()
         
-        # Try SD 3.5 first
         try:
             from diffusers import StableDiffusion3Pipeline
-            print(f"  Loading SD 3.5... (Free: {self._get_free_memory():.1f}GB)")
+            print(f"  Loading SD 3.5 Medium... (Free: {self._get_free_memory():.1f}GB)")
             
             self.sd_pipeline = StableDiffusion3Pipeline.from_pretrained(
                 self.synthetic_config.sd_model,
@@ -335,50 +334,11 @@ class SyntheticGenerationPipeline:
             # Aggressive cleanup after setup
             self._clear_gpu_memory()
             
-            print(f"  ✓ SD 3.5 loaded (Free: {self._get_free_memory():.1f}GB)")
-            return
+            print(f"  ✓ SD 3.5 Medium loaded (Free: {self._get_free_memory():.1f}GB)")
         except Exception as e:
-            print(f"  ⚠ SD 3.5 unavailable: {e}")
-        
-        # Try SDXL
-        try:
-            from diffusers import StableDiffusionXLPipeline
-            print(f"  Loading SDXL fallback... (Free: {self._get_free_memory():.1f}GB)")
-            
-            self.sd_pipeline = StableDiffusionXLPipeline.from_pretrained(
-                "stabilityai/stable-diffusion-xl-base-1.0",
-                torch_dtype=torch.float16,
-                variant="fp16",
-                use_safetensors=True
-            )
-            # Use sequential offload - more memory efficient, less CPU intensive
-            self.sd_pipeline.enable_sequential_cpu_offload()
-            self.sd_pipeline.enable_attention_slicing()
-            self.sd_pipeline.enable_vae_slicing()
-            
-            print(f"  ✓ SDXL loaded (Free: {self._get_free_memory():.1f}GB)")
-            return
-        except Exception as e:
-            print(f"  ⚠ SDXL unavailable: {e}")
-        
-        # Try SD 2.1
-        try:
-            from diffusers import StableDiffusionPipeline
-            print(f"  Loading SD 2.1 fallback... (Free: {self._get_free_memory():.1f}GB)")
-            
-            self.sd_pipeline = StableDiffusionPipeline.from_pretrained(
-                "stabilityai/stable-diffusion-2-1",
-                torch_dtype=torch.float16
-            )
-            # Use sequential offload - more memory efficient, less CPU intensive
-            self.sd_pipeline.enable_sequential_cpu_offload()
-            self.sd_pipeline.enable_attention_slicing()
-            
-            print(f"  ✓ SD 2.1 loaded (Free: {self._get_free_memory():.1f}GB)")
-            return
-        except Exception as e:
-            print(f"  ✗ All SD models failed: {e}")
+            print(f"  ✗ SD 3.5 Medium failed: {e}")
             self.sd_pipeline = None
+            raise
     
     
     def _load_clip(self):
@@ -552,7 +512,11 @@ class SyntheticGenerationPipeline:
                 images=image,
                 text=text_prompt,
                 return_tensors="pt"
-            ).to(self.device)
+            )
+            
+            # Convert to float16 to match model dtype
+            inputs = {k: v.to(self.device).to(torch.float16) if v.dtype == torch.float32 else v.to(self.device) 
+                     for k, v in inputs.items()}
             
             # Run model
             with torch.no_grad():
@@ -670,10 +634,13 @@ class SyntheticGenerationPipeline:
                 return_tensors="pt"
             )
             
-            # Move to device
+            # Move to device and convert to float16 to match model dtype
             for k, v in inputs.items():
                 if hasattr(v, 'to'):
-                    inputs[k] = v.to(self.device)
+                    if v.dtype == torch.float32:
+                        inputs[k] = v.to(self.device).to(torch.float16)
+                    else:
+                        inputs[k] = v.to(self.device)
             
             # Run model
             with torch.no_grad():
