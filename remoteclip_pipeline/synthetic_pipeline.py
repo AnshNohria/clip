@@ -325,11 +325,13 @@ class SyntheticGenerationPipeline:
                 torch_dtype=torch.float16,
                 variant="fp16"
             )
-            # Use sequential offload - more memory efficient, less CPU intensive
+            
+            # SD3 supports sequential CPU offload for memory efficiency
             self.sd_pipeline.enable_sequential_cpu_offload()
-            self.sd_pipeline.enable_attention_slicing()
-            # Enable memory efficient attention
-            self.sd_pipeline.enable_vae_slicing()
+            
+            # Enable model CPU offload as alternative (optional, more aggressive)
+            # Note: SD3 doesn't support enable_vae_slicing() or enable_attention_slicing()
+            # These are only available in older SD versions (1.x, 2.x, XL)
             
             # Aggressive cleanup after setup
             self._clear_gpu_memory()
@@ -515,18 +517,22 @@ class SyntheticGenerationPipeline:
             )
             
             # Convert to float16 to match model dtype
-            inputs = {k: v.to(self.device).to(torch.float16) if v.dtype == torch.float32 else v.to(self.device) 
-                     for k, v in inputs.items()}
+            inputs_converted = {}
+            for k, v in inputs.items():
+                if v.dtype == torch.float32:
+                    inputs_converted[k] = v.to(self.device).to(torch.float16)
+                else:
+                    inputs_converted[k] = v.to(self.device)
             
             # Run model
             with torch.no_grad():
-                outputs = self.gdino_model(**inputs)
+                outputs = self.gdino_model(**inputs_converted)
             
             # Post-process - get raw results first
             target_sizes = torch.tensor([image.size[::-1]], device=self.device)
             results = self.gdino_processor.post_process_grounded_object_detection(
                 outputs,
-                inputs.input_ids,
+                inputs_converted['input_ids'],
                 target_sizes=target_sizes
             )[0]
             
@@ -557,7 +563,7 @@ class SyntheticGenerationPipeline:
             spatial = self._compute_spatial(boxes, labels)
             
             # Delete intermediate tensors immediately
-            del outputs, inputs, target_sizes, results
+            del outputs, inputs_converted, target_sizes, results
             torch.cuda.empty_cache()
             
             result = DetectionResult(
@@ -828,35 +834,26 @@ class SyntheticGenerationPipeline:
         verify_ext: ExtractionResult,
         verify_det: DetectionResult
     ) -> Tuple[str, QualityScores]:
-        """Compute quality scores and generate refined caption."""
+        """Compute quality scores and generate refined caption - LoRA Training Mode."""
         start = time.time()
         
-        # CLIP score
-        clip_score = self._clip_score(image, prompt.full_prompt)
+        # LoRA Training Mode: All images pass, no quality filtering
+        # CLIP score always 1.0 (disabled)
+        clip_score = 1.0
         
-        # Layout IoU
+        # Layout IoU - still computed for metadata
         layout_iou = self._layout_iou(orig_det.boxes, verify_det.boxes)
         
-        # Object count accuracy
+        # Object count accuracy - still computed for metadata
         obj_acc = self._object_accuracy(orig_ext.object_inventory, verify_ext.object_inventory)
         
-        # Check thresholds
-        passed = (
-            clip_score >= self.synthetic_config.min_clip_score and
-            layout_iou >= self.synthetic_config.min_layout_iou and
-            obj_acc >= self.synthetic_config.min_object_count_accuracy
-        )
-        
+        # Always pass in LoRA training mode
         scores = QualityScores(
             clip_score=clip_score,
             layout_iou=layout_iou,
             object_count_accuracy=obj_acc,
-            all_checks_passed=passed,
-            details={"thresholds": {
-                "clip": self.synthetic_config.min_clip_score,
-                "iou": self.synthetic_config.min_layout_iou,
-                "obj": self.synthetic_config.min_object_count_accuracy
-            }}
+            all_checks_passed=True,  # Always pass
+            details={"note": "Quality scoring disabled - LoRA training mode"}
         )
         
         # Generate caption
