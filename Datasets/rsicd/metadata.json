@@ -1,0 +1,20 @@
+{
+  "dataset": "arampacha/rsicd",
+  "splits": {
+    "train": {
+      "num_examples": 8734,
+      "images_dir": "Datasets\\rsicd\\train\\images",
+      "jsonl": "Datasets\\rsicd\\train.jsonl"
+    },
+    "test": {
+      "num_examples": 1093,
+      "images_dir": "Datasets\\rsicd\\test\\images",
+      "jsonl": "Datasets\\rsicd\\test.jsonl"
+    },
+    "valid": {
+      "num_examples": 1094,
+      "images_dir": "Datasets\\rsicd\\valid\\images",
+      "jsonl": "Datasets\\rsicd\\valid.jsonl"
+    }
+  }
+}

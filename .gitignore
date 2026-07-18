@@ -33,7 +33,6 @@ outputs/
 results/
 
 # Datasets (large files - should be downloaded separately)
-Datasets/
 ClipDataset/
 
 # System files
