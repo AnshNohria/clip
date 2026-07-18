@@ -360,12 +360,11 @@ class SyntheticGenerationPipeline:
             return self._fallback_extraction()
         
         try:
-            prompt = """Analyze this aerial/satellite image. Provide:
+            prompt = """Analyze this aerial/satellite image in detail. Provide:
 1. SCENE_TYPE: (urban/rural/industrial/residential/agricultural/water/forest/etc.)
-2. OBJECT_INVENTORY: object1: count1, object2: count2
-3. LAYOUT_DESCRIPTION: spatial arrangement of objects
-4. APPEARANCE_DETAILS: colors, textures, materials
-5. LIGHTING_CONDITIONS: time of day, shadows"""
+2. OBJECT_INVENTORY: List ALL visible objects with accurate counts (e.g., "buildings: 45, roads: 8, vehicles: 12, trees: 20, parking lots: 3"). Be specific - identify buildings, roads, vehicles, trees, water bodies, bridges, parking areas, etc.
+3. LAYOUT_DESCRIPTION: Describe the spatial arrangement and how objects are organized (e.g., "buildings arranged in grid pattern, roads forming intersection, vehicles parked along streets")
+4. KEY_FEATURES: Notable landmarks or distinctive elements"""
 
             messages = [{
                 "role": "user",
@@ -435,8 +434,8 @@ class SyntheticGenerationPipeline:
         scene_type = "aerial scene"
         objects: Dict[str, int] = {}
         layout = "Objects distributed across the scene"
-        appearance = "Natural colors and textures"
-        lighting = "Daylight"
+        appearance = "Realistic aerial view"
+        lighting = "Natural lighting"
         
         for line in response.split('\n'):
             lower = line.lower().strip()
@@ -448,22 +447,18 @@ class SyntheticGenerationPipeline:
                 parts = line.split(':', 1)
                 if len(parts) > 1:
                     objects = self._parse_objects(parts[1])
-            elif 'layout' in lower:
+            elif 'layout' in lower and 'spatial' not in lower:
                 parts = line.split(':', 1)
                 if len(parts) > 1:
                     layout = parts[1].strip()
-            elif 'appearance' in lower:
+            elif 'key_features' in lower or 'key features' in lower:
                 parts = line.split(':', 1)
                 if len(parts) > 1:
                     appearance = parts[1].strip()
-            elif 'lighting' in lower:
-                parts = line.split(':', 1)
-                if len(parts) > 1:
-                    lighting = parts[1].strip()
         
         return ExtractionResult(
             scene_type=scene_type or "aerial scene",
-            object_inventory=objects or {"structure": 1},
+            object_inventory=objects or {"structures": 1},
             layout_description=layout,
             appearance_details=appearance,
             lighting_conditions=lighting,
@@ -471,26 +466,42 @@ class SyntheticGenerationPipeline:
         )
     
     def _parse_objects(self, text: str) -> Dict[str, int]:
-        """Parse object inventory string."""
+        """Parse object inventory string - handles multiple formats."""
         result = {}
-        for part in text.split(','):
+        # Split by commas or semicolons
+        parts = text.replace(';', ',').split(',')
+        for part in parts:
+            part = part.strip()
             if ':' in part:
+                # Format: "object: count"
                 name, count = part.split(':', 1)
                 name = name.strip().lower()
                 try:
                     result[name] = int(count.strip().split()[0])
                 except:
                     result[name] = 1
-        return result if result else {"structure": 1}
+            elif any(char.isdigit() for char in part):
+                # Format: "45 buildings" or "buildings 45"
+                words = part.split()
+                for i, word in enumerate(words):
+                    if word.isdigit():
+                        count = int(word)
+                        # Get the object name (other words)
+                        name_words = [w for j, w in enumerate(words) if j != i]
+                        name = ' '.join(name_words).strip().lower()
+                        if name:
+                            result[name] = count
+                        break
+        return result if result else {"structures": 1}
     
     def _fallback_extraction(self) -> ExtractionResult:
         """Fallback when Qwen is unavailable."""
         return ExtractionResult(
             scene_type="aerial scene",
-            object_inventory={"structure": 1},
+            object_inventory={"structures": 1},
             layout_description="Objects in aerial view",
-            appearance_details="Natural colors",
-            lighting_conditions="Daylight",
+            appearance_details="Realistic aerial view",
+            lighting_conditions="Natural lighting",
             raw_analysis="Fallback"
         )
     
@@ -714,20 +725,33 @@ class SyntheticGenerationPipeline:
         if detection.spatial_relationships:
             spatial = " " + ". ".join(detection.spatial_relationships[:5]) + "."
         
-        # Components
+        # Create realistic, detailed prompt focused on objects and layout
+        # Full prompt - realistic aerial image description
+        full = f"Realistic aerial satellite photograph of {extraction.scene_type} area"
+        
+        # Add detailed object inventory
+        if obj_text:
+            full += f" with {obj_text}"
+        
+        # Add layout and spatial information
+        if extraction.layout_description:
+            full += f". {extraction.layout_description}"
+        
+        if spatial:
+            full += spatial
+        
+        # Add key features if available
+        if extraction.appearance_details and extraction.appearance_details != "Realistic aerial view":
+            full += f". Notable features: {extraction.appearance_details}"
+        
+        # Add technical quality descriptors for realism
+        full += ". High resolution satellite imagery, sharp focus, natural colors, top-down orthographic view."
+        
+        # Components for metadata
         scene = f"aerial satellite view of {extraction.scene_type} area"
         layout = extraction.layout_description + spatial
-        objects = f"containing {obj_text}"
-        style = f"{extraction.appearance_details}, {extraction.lighting_conditions}"
-        
-        # Full prompt - detailed for better generation quality
-        # Note: SD3's CLIP tokenizer will truncate to 77 tokens automatically if needed
-        full = (
-            f"High-resolution {scene} {objects}. "
-            f"{layout} "
-            f"Photorealistic remote sensing imagery, sharp detail, natural colors, "
-            f"top-down orthographic view, professional satellite photography."
-        )
+        objects = f"containing {obj_text}" if obj_text else "structures"
+        style = "realistic aerial photography"
         
         result = GeneratedPrompt(
             full_prompt=full,
