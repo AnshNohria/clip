@@ -275,8 +275,12 @@ class SyntheticGenerationPipeline:
             raise
 
     def _load_grounding_dino(self):
-        """Load Grounding DINO (bf16, native, on analysis_device)."""
-        dtype = getattr(torch, self.synthetic_config.gdino_dtype)
+        """Load Grounding DINO (float32, on analysis_device).
+
+        Grounding DINO in transformers is not bf16-safe: the processor emits
+        float32 pixel tensors and several internal ops expect float32 weights.
+        """
+        dtype = getattr(torch, self.synthetic_config.gdino_dtype, torch.float32)
         print(f"  Loading Grounding DINO ({self.synthetic_config.gdino_dtype})... "
               f"(Free: {self._get_free_memory(self.analysis_device):.1f}GB)")
 
@@ -497,6 +501,17 @@ class SyntheticGenerationPipeline:
     # Stage 2: Grounding DINO Detection
     # =========================================================================
 
+    def _cast_gdino_inputs(self, inputs, model_dtype: torch.dtype):
+        """Move GDINO batch tensors to analysis_device with matching dtypes."""
+        for key, value in inputs.items():
+            if not hasattr(value, "to"):
+                continue
+            if value.is_floating_point():
+                inputs[key] = value.to(device=self.analysis_device, dtype=model_dtype)
+            else:
+                inputs[key] = value.to(device=self.analysis_device)
+        return inputs
+
     def stage2_detection(self, image: Image.Image, objects: Dict[str, int]) -> DetectionResult:
         """Detect objects with Grounding DINO."""
         start = time.time()
@@ -511,11 +526,9 @@ class SyntheticGenerationPipeline:
                 images=image,
                 text=text_prompt,
                 return_tensors="pt"
-            ).to(self.analysis_device)
-
+            )
             model_dtype = next(self.gdino_model.parameters()).dtype
-            if "pixel_values" in inputs and hasattr(inputs["pixel_values"], "to"):
-                inputs["pixel_values"] = inputs["pixel_values"].to(dtype=model_dtype)
+            inputs = self._cast_gdino_inputs(inputs, model_dtype)
 
             with torch.no_grad():
                 outputs = self.gdino_model(**inputs)

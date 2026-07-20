@@ -38,7 +38,7 @@ class SyntheticConfig:
 
     # Grounding DINO settings (object/spatial grounding for prompts+captions)
     gdino_model: str = "IDEA-Research/grounding-dino-base"
-    gdino_dtype: str = "bfloat16"
+    gdino_dtype: str = "float32"  # bf16 causes dtype mismatch in transformers GDINO
     gdino_confidence: float = 0.35
     gdino_box_threshold: float = 0.35
     gdino_text_threshold: float = 0.25
