@@ -7,13 +7,14 @@ Saves each repo under:
 
 No GPU required — this only downloads weights/config/tokenizer files.
 
+Uses HF_TOKEN from the repo .env for gated repos (FLUX.1-dev, SD3.5 Large).
+
 Usage (from the clip repo root):
     python setup/download_all_models.py
-    python setup/download_all_models.py --skip-gated   # skip FLUX / SD3.5 if you
-                                                      # have not accepted licenses yet
+    python setup/download_all_models.py --skip-gated
     python setup/download_all_models.py --only qwen,flux
 
-Gated models (accept the license on HuggingFace first, then set HF_TOKEN):
+Gated models (accept the license on HuggingFace with the SAME account as HF_TOKEN):
     https://huggingface.co/black-forest-labs/FLUX.1-dev
     https://huggingface.co/stabilityai/stable-diffusion-3.5-large
 """
@@ -38,15 +39,39 @@ ENV_CANDIDATES = [
 
 
 def _load_dotenv() -> None:
+    """Load repo .env so HF_TOKEN is available (override any empty shell vars)."""
     try:
         from dotenv import load_dotenv
     except ImportError:
+        print("WARNING: python-dotenv not installed; relying on process env only")
         return
     for env_path in ENV_CANDIDATES:
         if env_path.exists():
-            load_dotenv(env_path)
+            # override=True so a blank HF_TOKEN in the shell cannot block .env
+            load_dotenv(env_path, override=True)
             print(f"Loaded env from {env_path}")
             return
+    print(f"WARNING: no .env found (looked in {[str(p) for p in ENV_CANDIDATES]})")
+
+
+def _resolve_hf_token() -> Optional[str]:
+    """Read HF_TOKEN / HUGGING_FACE_HUB_TOKEN and strip quotes/whitespace."""
+    raw = (
+        os.getenv("HF_TOKEN")
+        or os.getenv("HUGGING_FACE_HUB_TOKEN")
+        or os.getenv("HUGGINGFACE_HUB_TOKEN")
+        or ""
+    )
+    token = raw.strip().strip('"').strip("'").strip()
+    return token or None
+
+
+def _mask_token(token: str) -> str:
+    if not token:
+        return "(none)"
+    if len(token) <= 10:
+        return "***"
+    return f"{token[:6]}...{token[-4:]}"
 
 
 def _local_dir_for(repo_id: str, models_dir: Optional[Path] = None) -> Path:
@@ -116,20 +141,45 @@ MODELS: List[Dict] = [
 # Download helpers
 # ---------------------------------------------------------------------------
 
-def _login_hf(token: Optional[str]) -> None:
+def _login_hf(token: Optional[str], require_for_gated: bool) -> str:
+    """
+    Authenticate with HuggingFace using HF_TOKEN from .env.
+
+    Injects the token into the process environment so every
+    huggingface_hub / transformers / diffusers call picks it up, and
+    verifies it with whoami() before any gated download starts.
+    """
     if not token:
-        print(
-            "WARNING: HF_TOKEN not set. Public models will still download; "
-            "gated models (FLUX / SD3.5) will fail until you set HF_TOKEN "
-            "and accept their licenses on HuggingFace."
+        msg = (
+            "HF_TOKEN not found. Put it in the repo .env as:\n"
+            "  HF_TOKEN=hf_xxxxxxxx\n"
+            "(no spaces; quotes optional). Gated repos (FLUX / SD3.5) require it."
         )
-        return
+        if require_for_gated:
+            print(f"ERROR: {msg}")
+            sys.exit(1)
+        print(f"WARNING: {msg}")
+        return ""
+
+    # Make sure every HF client (hub, transformers, diffusers) sees the token
+    os.environ["HF_TOKEN"] = token
+    os.environ["HUGGING_FACE_HUB_TOKEN"] = token
+    os.environ["HUGGINGFACE_HUB_TOKEN"] = token
+
     try:
-        from huggingface_hub import login
+        from huggingface_hub import HfApi, login
+
         login(token=token, add_to_git_credential=False)
-        print("Logged in to HuggingFace")
+        info = HfApi(token=token).whoami(token=token)
+        username = info.get("name") or info.get("fullname") or "unknown"
+        print(f"Logged in to HuggingFace as '{username}' (token {_mask_token(token)})")
+        return token
     except Exception as e:
-        print(f"ERROR: HuggingFace login failed: {e}")
+        print(f"ERROR: HuggingFace login / whoami failed: {e}")
+        print(
+            "Check that HF_TOKEN in .env is a valid token and that you have "
+            "accepted gated model licenses on huggingface.co with the same account."
+        )
         sys.exit(1)
 
 
@@ -152,17 +202,24 @@ def _download_one(
         print(f"  Notes:     {model['notes']}")
     if model.get("gated"):
         print(f"  License:   {model.get('license_url', 'see HuggingFace page')}")
+        print(f"  Auth:      using HF_TOKEN={_mask_token(token or '')}")
 
     # Skip if already present and not forcing (heuristic: any weight file exists)
     if not force and _looks_downloaded(local_dir):
         print("  SKIP: already present (use --force to re-download)")
         return True
 
+    if model.get("gated") and not token:
+        print("  FAIL: gated repo requires HF_TOKEN")
+        return False
+
     try:
         kwargs = {
             "repo_id": repo_id,
             "local_dir": str(local_dir),
-            "token": token,
+            # Explicit token on every call — required for gated repos.
+            # token=True falls back to the cached/login token if string is empty.
+            "token": token if token else True,
             "resume_download": True,
             "max_workers": 8,
         }
@@ -176,8 +233,9 @@ def _download_one(
         print(f"  FAIL: {model['name']}: {e}")
         if model.get("gated"):
             print(
-                "  Hint: accept the model license on HuggingFace, then ensure "
-                "HF_TOKEN has access to this repo."
+                "  Hint: open the license URL above, click "
+                "'Agree and access repository', then re-run. "
+                "Your HF_TOKEN must belong to the same account."
             )
         return False
 
@@ -236,9 +294,6 @@ def main() -> int:
     models_dir = Path(args.models_dir).resolve()
     models_dir.mkdir(parents=True, exist_ok=True)
 
-    token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
-    _login_hf(token)
-
     selected = MODELS
     if args.only:
         keys = {k.strip().lower() for k in args.only.split(",") if k.strip()}
@@ -252,11 +307,15 @@ def main() -> int:
     if args.skip_gated:
         selected = [m for m in selected if not m.get("gated")]
 
+    needs_gated = any(m.get("gated") for m in selected)
+    token = _login_hf(_resolve_hf_token(), require_for_gated=needs_gated)
+
     print()
     print("=" * 70)
     print("REMOTECLIP MODEL DOWNLOADER")
     print("=" * 70)
     print(f"Destination: {models_dir}")
+    print(f"HF auth:     {'yes (' + _mask_token(token) + ')' if token else 'no'}")
     print(f"Models:      {len(selected)}")
     for m in selected:
         tag = " [GATED]" if m.get("gated") else ""
@@ -269,7 +328,12 @@ def main() -> int:
         print("-" * 70)
         print(f"[{i}/{len(selected)}] {model['name']}")
         print("-" * 70)
-        ok = _download_one(model, token=token, force=args.force, models_dir=models_dir)
+        ok = _download_one(
+            model,
+            token=token or None,
+            force=args.force,
+            models_dir=models_dir,
+        )
         results[model["key"]] = ok
         print()
 
@@ -283,20 +347,6 @@ def main() -> int:
     print()
     print(f"{ok_count}/{len(results)} succeeded")
     print(f"Models root: {models_dir}")
-    print()
-    print("Point the pipeline at local paths, e.g.:")
-    print(
-        "  SyntheticConfig.qwen_model  = "
-        f"'{_local_dir_for('Qwen/Qwen2.5-VL-7B-Instruct', models_dir)}'"
-    )
-    print(
-        "  SyntheticConfig.sd_model    = "
-        f"'{_local_dir_for('black-forest-labs/FLUX.1-dev', models_dir)}'"
-    )
-    print(
-        "  SyntheticConfig.gdino_model = "
-        f"'{_local_dir_for('IDEA-Research/grounding-dino-base', models_dir)}'"
-    )
     print("=" * 70)
 
     return 0 if all(results.values()) else 1
