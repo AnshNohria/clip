@@ -54,6 +54,12 @@ from PIL import Image
 
 try:
     from .config import PipelineConfig, SyntheticConfig
+    from .dataset_paths import (
+        collect_rsicd_images,
+        describe_rsicd_layout,
+        get_repo_root,
+        resolve_rsicd_source_dir,
+    )
 except ImportError:
     # Allow: python remoteclip_pipeline/synthetic_pipeline.py ...
     import sys
@@ -61,6 +67,12 @@ except ImportError:
     if str(_repo_root) not in sys.path:
         sys.path.insert(0, str(_repo_root))
     from remoteclip_pipeline.config import PipelineConfig, SyntheticConfig
+    from remoteclip_pipeline.dataset_paths import (
+        collect_rsicd_images,
+        describe_rsicd_layout,
+        get_repo_root,
+        resolve_rsicd_source_dir,
+    )
 
 
 # =============================================================================
@@ -972,14 +984,15 @@ class SyntheticGenerationPipeline:
         if target_count:
             self.synthetic_config.target_synthetic_count = target_count
 
-        images = []
-        for ext in ['*.jpg', '*.jpeg', '*.png', '*.bmp', '*.tif', '*.tiff']:
-            images.extend(source_path.glob(ext))
-            images.extend(source_path.glob(ext.upper()))
+        images = collect_rsicd_images(source_path)
 
         if not images:
-            print(f"No images in {source_path}")
+            print(f"No images found under {source_path}")
+            print(describe_rsicd_layout(source_path))
             return {"generated": 0, "pairs_generated": 0, "samples": []}
+
+        print(describe_rsicd_layout(source_path))
+        print(f"Total source images collected: {len(images)}")
 
         # Respect n_source_images cap if fewer/more are available than requested
         max_sources = self.synthetic_config.n_source_images
@@ -1025,11 +1038,6 @@ class SyntheticGenerationPipeline:
 # CLI (direct execution)
 # =============================================================================
 
-def get_repo_root() -> Path:
-    """Absolute path to the clip repo root (/home/jovyan/clip on the server)."""
-    return Path(__file__).resolve().parent.parent
-
-
 def _load_env(repo_root: Path) -> None:
     """Load /home/jovyan/clip/.env and ensure HF cache dirs exist."""
     env_path = repo_root / ".env"
@@ -1048,20 +1056,6 @@ def _load_env(repo_root: Path) -> None:
     if not os.environ.get("HUGGINGFACE_HUB_CACHE"):
         os.environ["HUGGINGFACE_HUB_CACHE"] = os.environ["HF_HOME"]
     Path(os.environ["HF_HOME"]).mkdir(parents=True, exist_ok=True)
-
-
-def _resolve_source_dir(repo_root: Path, explicit: Optional[str]) -> Path:
-    if explicit:
-        return Path(explicit).expanduser().resolve()
-    candidates = [
-        repo_root / "RS-TransCLIP" / "datasets" / "rsicd_images",
-        repo_root / "datasets" / "rsicd_images",
-    ]
-    for path in candidates:
-        if path.exists():
-            return path.resolve()
-    # Return first candidate for a clear error message downstream
-    return candidates[0].resolve()
 
 
 def _local_model_path(models_dir: Path, repo_id: str) -> Optional[Path]:
@@ -1098,8 +1092,9 @@ def _parse_cli_args():
     parser.add_argument(
         "--source-dir",
         type=str,
-        default=None,
-        help="Directory with source satellite images",
+        default=str(repo_root / "Datasets" / "rsicd"),
+        help="RSICD root with train/test/valid subfolders "
+             "(default: /home/jovyan/clip/Datasets/rsicd)",
     )
     parser.add_argument(
         "--output-dir",
@@ -1136,17 +1131,16 @@ def main() -> int:
         os.environ["HF_TOKEN"] = token
         os.environ["HUGGING_FACE_HUB_TOKEN"] = token
 
-    source_dir = _resolve_source_dir(repo_root, args.source_dir)
+    source_dir = resolve_rsicd_source_dir(repo_root, args.source_dir)
     if not source_dir.exists():
-        print(f"ERROR: source image directory not found: {source_dir}")
-        print("\nTried (auto-detect):")
-        print(f"  {repo_root / 'RS-TransCLIP' / 'datasets' / 'rsicd_images'}")
-        print(f"  {repo_root / 'datasets' / 'rsicd_images'}")
-        print("\nRun from the repo root and/or pass --source-dir explicitly, e.g.:")
-        print("  cd /home/jovyan/clip")
+        print(f"ERROR: RSICD source directory not found: {source_dir}")
+        print("\nExpected layout:")
+        print("  /home/jovyan/clip/Datasets/rsicd/train/")
+        print("  /home/jovyan/clip/Datasets/rsicd/test/")
+        print("  /home/jovyan/clip/Datasets/rsicd/valid/")
+        print("\nRun with an explicit path if needed:")
         print("  python remoteclip_pipeline/synthetic_pipeline.py \\")
-        print("    --synthetic-count 250 \\")
-        print("    --source-dir /home/jovyan/clip/datasets/rsicd_images")
+        print("    --source-dir /home/jovyan/clip/Datasets/rsicd")
         return 1
 
     output_dir = Path(args.output_dir).expanduser().resolve()

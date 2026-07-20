@@ -36,13 +36,8 @@ from .config import (
     PipelineConfig, SyntheticConfig, ZoomCropConfig, 
     TrainingConfig, EvaluationConfig
 )
-from .synthetic_pipeline import (
-    SyntheticGenerationPipeline,
-    get_repo_root,
-    _load_env,
-    _resolve_source_dir,
-    _apply_local_models,
-)
+from .synthetic_pipeline import SyntheticGenerationPipeline, _apply_local_models, _load_env
+from .dataset_paths import get_repo_root, resolve_rsicd_source_dir
 from .zoom_crops_pipeline import ZoomCropsPipeline
 from .prompt_refinement import PromptRefinementEngine
 from .stage2_trainer import Stage2SyntheticHeavyTrainer
@@ -146,13 +141,12 @@ class RemoteCLIPPipeline:
             target = target_count or self.config.synthetic.target_count
             
             repo_root = get_repo_root()
-            source_dir = _resolve_source_dir(repo_root, None)
+            source_dir = resolve_rsicd_source_dir(repo_root, None)
             if not source_dir.exists():
                 raise FileNotFoundError(
-                    f"Required input directory missing: {source_dir}\n"
-                    f"Expected one of:\n"
-                    f"  {repo_root / 'RS-TransCLIP' / 'datasets' / 'rsicd_images'}\n"
-                    f"  {repo_root / 'datasets' / 'rsicd_images'}"
+                    f"Required RSICD directory missing: {source_dir}\n"
+                    f"Expected layout under /home/jovyan/clip/Datasets/rsicd/:\n"
+                    f"  train/  test/  valid/"
                 )
             
             result = self.synthetic_pipeline.generate_dataset(
@@ -595,7 +589,7 @@ def main():
     pipeline = RemoteCLIPPipeline(config)
     
     # Resolve source images directory under repo root
-    real_images_dir = _resolve_source_dir(repo_root, None)
+    real_images_dir = resolve_rsicd_source_dir(repo_root, None)
     rsicd_path = Path(args.rsicd_path) if args.rsicd_path else None
     
     # Run selected stage

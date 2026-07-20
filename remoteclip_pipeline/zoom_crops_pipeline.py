@@ -754,11 +754,9 @@ class ZoomCropsPipeline:
         self.crops_dir = output_dir
         self.crops_dir.mkdir(parents=True, exist_ok=True)
         
-        # Collect source images
-        source_images = []
-        for ext in ['*.jpg', '*.jpeg', '*.png', '*.bmp', '*.tif', '*.tiff']:
-            source_images.extend(images_dir.glob(ext))
-            source_images.extend(images_dir.glob(ext.upper()))
+        # Collect source images from RSICD train/test/valid splits
+        from .dataset_paths import collect_rsicd_images
+        source_images = collect_rsicd_images(images_dir)
         
         if not source_images:
             print(f"No images found in {images_dir}")
