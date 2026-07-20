@@ -36,7 +36,13 @@ from .config import (
     PipelineConfig, SyntheticConfig, ZoomCropConfig, 
     TrainingConfig, EvaluationConfig
 )
-from .synthetic_pipeline import SyntheticGenerationPipeline
+from .synthetic_pipeline import (
+    SyntheticGenerationPipeline,
+    get_repo_root,
+    _load_env,
+    _resolve_source_dir,
+    _apply_local_models,
+)
 from .zoom_crops_pipeline import ZoomCropsPipeline
 from .prompt_refinement import PromptRefinementEngine
 from .stage2_trainer import Stage2SyntheticHeavyTrainer
@@ -139,14 +145,18 @@ class RemoteCLIPPipeline:
             
             target = target_count or self.config.synthetic.target_count
             
-            # Force source directory to RS-TransCLIP/datasets/rsicd_images
-            repo_root = Path(__file__).resolve().parent.parent
-            forced_source = repo_root / "RS-TransCLIP" / "datasets" / "rsicd_images"
-            if not forced_source.exists():
-                raise FileNotFoundError(f"Required input directory missing: {forced_source}")
+            repo_root = get_repo_root()
+            source_dir = _resolve_source_dir(repo_root, None)
+            if not source_dir.exists():
+                raise FileNotFoundError(
+                    f"Required input directory missing: {source_dir}\n"
+                    f"Expected one of:\n"
+                    f"  {repo_root / 'RS-TransCLIP' / 'datasets' / 'rsicd_images'}\n"
+                    f"  {repo_root / 'datasets' / 'rsicd_images'}"
+                )
             
             result = self.synthetic_pipeline.generate_dataset(
-                source_images_dir=forced_source,
+                source_images_dir=source_dir,
                 output_dir=self.synthetic_dir,
                 target_count=target
             )
@@ -561,13 +571,14 @@ def main():
     """Main entry point."""
     args = parse_args()
 
-    # Set HF cache to repo-local folder if not provided
-    repo_root = Path(__file__).resolve().parent.parent
+    repo_root = get_repo_root()
+    _load_env(repo_root)
     _configure_hf_cache(repo_root)
     
     # Create config
     synthetic_cfg = SyntheticConfig()
     synthetic_cfg.target_synthetic_count = args.synthetic_count
+    _apply_local_models(synthetic_cfg, repo_root / "models")
     
     zoom_cfg = ZoomCropConfig()
     zoom_cfg.target_crop_count = args.crop_count
@@ -583,9 +594,8 @@ def main():
     # Create pipeline
     pipeline = RemoteCLIPPipeline(config)
     
-    # Always use RS-TransCLIP/datasets/rsicd_images as input source
-    fixed_real_dir = repo_root / "RS-TransCLIP" / "datasets" / "rsicd_images"
-    real_images_dir = fixed_real_dir
+    # Resolve source images directory under repo root
+    real_images_dir = _resolve_source_dir(repo_root, None)
     rsicd_path = Path(args.rsicd_path) if args.rsicd_path else None
     
     # Run selected stage

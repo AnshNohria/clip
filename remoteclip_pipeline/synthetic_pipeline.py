@@ -52,7 +52,15 @@ import torch
 import numpy as np
 from PIL import Image
 
-from .config import PipelineConfig
+try:
+    from .config import PipelineConfig, SyntheticConfig
+except ImportError:
+    # Allow: python remoteclip_pipeline/synthetic_pipeline.py ...
+    import sys
+    _repo_root = Path(__file__).resolve().parent.parent
+    if str(_repo_root) not in sys.path:
+        sys.path.insert(0, str(_repo_root))
+    from remoteclip_pipeline.config import PipelineConfig, SyntheticConfig
 
 
 # =============================================================================
@@ -1011,3 +1019,184 @@ class SyntheticGenerationPipeline:
             "manifest_path": str(manifest_path),
             "samples": samples
         }
+
+
+# =============================================================================
+# CLI (direct execution)
+# =============================================================================
+
+def get_repo_root() -> Path:
+    """Absolute path to the clip repo root (/home/jovyan/clip on the server)."""
+    return Path(__file__).resolve().parent.parent
+
+
+def _load_env(repo_root: Path) -> None:
+    """Load /home/jovyan/clip/.env and ensure HF cache dirs exist."""
+    env_path = repo_root / ".env"
+    if env_path.exists():
+        try:
+            from dotenv import load_dotenv
+            load_dotenv(env_path, override=True)
+            print(f"Loaded env from {env_path}")
+        except ImportError:
+            pass
+
+    # Fallback HF cache under repo root when .env does not set it
+    default_hf = repo_root / "checkpoints" / "huggingface"
+    if not os.environ.get("HF_HOME"):
+        os.environ["HF_HOME"] = str(default_hf)
+    if not os.environ.get("HUGGINGFACE_HUB_CACHE"):
+        os.environ["HUGGINGFACE_HUB_CACHE"] = os.environ["HF_HOME"]
+    Path(os.environ["HF_HOME"]).mkdir(parents=True, exist_ok=True)
+
+
+def _resolve_source_dir(repo_root: Path, explicit: Optional[str]) -> Path:
+    if explicit:
+        return Path(explicit).expanduser().resolve()
+    candidates = [
+        repo_root / "RS-TransCLIP" / "datasets" / "rsicd_images",
+        repo_root / "datasets" / "rsicd_images",
+    ]
+    for path in candidates:
+        if path.exists():
+            return path.resolve()
+    # Return first candidate for a clear error message downstream
+    return candidates[0].resolve()
+
+
+def _local_model_path(models_dir: Path, repo_id: str) -> Optional[Path]:
+    local = models_dir / repo_id.replace("/", "__")
+    return local if local.exists() else None
+
+
+def _apply_local_models(synthetic_cfg: SyntheticConfig, models_dir: Path) -> None:
+    """Point config at clip/models/ downloads when present."""
+    mapping = {
+        "qwen_model": "Qwen/Qwen2.5-VL-7B-Instruct",
+        "gdino_model": "IDEA-Research/grounding-dino-base",
+        "sd_model": "black-forest-labs/FLUX.1-dev",
+    }
+    for attr, repo_id in mapping.items():
+        local = _local_model_path(models_dir, repo_id)
+        if local is not None:
+            setattr(synthetic_cfg, attr, str(local))
+
+
+def _parse_cli_args():
+    import argparse
+
+    repo_root = get_repo_root()
+    parser = argparse.ArgumentParser(
+        description="Run the synthetic generation pipeline (Stage 1A)"
+    )
+    parser.add_argument(
+        "--synthetic-count",
+        type=int,
+        default=50000,
+        help="Target number of synthetic images to generate",
+    )
+    parser.add_argument(
+        "--source-dir",
+        type=str,
+        default=None,
+        help="Directory with source satellite images",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=str,
+        default=str(repo_root / "outputs" / "remoteclip_pipeline"),
+        help="Pipeline output directory",
+    )
+    parser.add_argument(
+        "--models-dir",
+        type=str,
+        default=str(repo_root / "models"),
+        help="Local models directory (from setup/download_all_models.py)",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        default="cuda",
+        help="Primary device (cuda or cpu)",
+    )
+    # Accepted for compatibility with main.py CLI; ignored here.
+    parser.add_argument("--crop-count", type=int, default=0, help=argparse.SUPPRESS)
+    return parser.parse_args()
+
+
+def main() -> int:
+    """Entry point when run as: python remoteclip_pipeline/synthetic_pipeline.py"""
+    args = _parse_cli_args()
+    repo_root = get_repo_root()
+    _load_env(repo_root)
+
+    token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
+    if token:
+        token = token.strip().strip('"').strip("'")
+        os.environ["HF_TOKEN"] = token
+        os.environ["HUGGING_FACE_HUB_TOKEN"] = token
+
+    source_dir = _resolve_source_dir(repo_root, args.source_dir)
+    if not source_dir.exists():
+        print(f"ERROR: source image directory not found: {source_dir}")
+        print("\nTried (auto-detect):")
+        print(f"  {repo_root / 'RS-TransCLIP' / 'datasets' / 'rsicd_images'}")
+        print(f"  {repo_root / 'datasets' / 'rsicd_images'}")
+        print("\nRun from the repo root and/or pass --source-dir explicitly, e.g.:")
+        print("  cd /home/jovyan/clip")
+        print("  python remoteclip_pipeline/synthetic_pipeline.py \\")
+        print("    --synthetic-count 250 \\")
+        print("    --source-dir /home/jovyan/clip/datasets/rsicd_images")
+        return 1
+
+    output_dir = Path(args.output_dir).expanduser().resolve()
+    models_dir = Path(args.models_dir).expanduser().resolve()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    synthetic_cfg = SyntheticConfig()
+    synthetic_cfg.target_synthetic_count = args.synthetic_count
+    _apply_local_models(synthetic_cfg, models_dir)
+
+    config = PipelineConfig(
+        device=args.device,
+        output_dir=output_dir / "synthetic",
+        checkpoint_dir=repo_root / "checkpoints" / "remoteclip",
+        synthetic=synthetic_cfg,
+    )
+
+    print("=" * 70)
+    print("SYNTHETIC GENERATION PIPELINE")
+    print("=" * 70)
+    print(f"Repo root:  {repo_root}")
+    print(f"Source:     {source_dir}")
+    print(f"Output:     {output_dir}")
+    print(f"Models dir: {models_dir}")
+    print(f"HF cache:   {os.environ.get('HF_HOME', '(default)')}")
+    print(f"Target:     {args.synthetic_count} synthetic images")
+    print(f"Models:     qwen={synthetic_cfg.qwen_model}")
+    print(f"            gdino={synthetic_cfg.gdino_model}")
+    print(f"            sd={synthetic_cfg.sd_model}")
+    print("=" * 70)
+
+    pipeline = SyntheticGenerationPipeline(config)
+    pipeline.synthetic_dir = output_dir / "images"
+    pipeline.metadata_dir = output_dir / "metadata"
+    pipeline.synthetic_dir.mkdir(parents=True, exist_ok=True)
+    pipeline.metadata_dir.mkdir(parents=True, exist_ok=True)
+
+    result = pipeline.generate_dataset(
+        source_images_dir=source_dir,
+        output_dir=output_dir,
+        target_count=args.synthetic_count,
+    )
+
+    print("\nDone.")
+    print(f"  Synthetic images: {result.get('generated', 0)}")
+    print(f"  Image-caption pairs: {result.get('pairs_generated', 0)}")
+    print(f"  Manifest: {result.get('manifest_path', 'N/A')}")
+    return 0 if result.get("generated", 0) > 0 or args.synthetic_count == 0 else 1
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(main())
