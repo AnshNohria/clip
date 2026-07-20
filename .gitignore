@@ -34,7 +34,7 @@ results/
 
 # Datasets (large files - should be downloaded separately)
 ClipDataset/
-
+models/
 # System files
 .DS_Store
 Thumbs.db

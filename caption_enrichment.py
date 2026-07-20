@@ -1,26 +1,43 @@
 #!/usr/bin/env python3
 """
-M2B (Mask-to-Box) and B2C (Box-to-Caption) Caption Enrichment
-============================================================
-Enriches RSICD dataset captions using pure image processing techniques.
-NO ML models, NO HuggingFace dependencies.
+RemoteCLIP-style M2B (Mask-to-Box) + B2C (Box-to-Caption)
+=======================================================
+Paper-standard pipeline for converting remote-sensing images into
+OpenCLIP-compatible image-caption pairs.
 
-Techniques used:
-- M2B: Edge detection, contour finding, connected components → Bounding boxes
-- B2C: Color analysis, texture features, shape descriptors → Region descriptions
+Pipeline:
+  RGB image
+    -> PseudoMaskGenerator (classical CV land-cover mask; no ML)
+    -> M2B (findContours per class + boundingRect)
+    -> boxes + labels
+    -> B2C (5 rule-based captions: center / peripheral / random subsets)
+    -> JSONL {image, caption}
 
-Author: Caption Enrichment Pipeline
+RSICD has no ground-truth masks, so masks are synthesized from color
+land-cover classification + morphology. Adjacent same-class regions
+merge into one box (connected-component limit noted in the paper).
+
+Depends only on: opencv-python-headless, numpy, Pillow (no ML).
+
+Alternates for M2B when you already have instance masks:
+  - torchvision.ops.masks_to_boxes
+  - supervision.mask_to_xyxy
 """
 
-import os
+from __future__ import annotations
+
+import argparse
 import json
-import csv
-from pathlib import Path
-from PIL import Image, ImageFilter, ImageStat, ImageDraw
-import numpy as np
+import random
+import re
+import sys
 from collections import Counter
-from typing import Dict, List, Tuple, Optional
-import colorsys
+from pathlib import Path
+from typing import Dict, List, Optional, Sequence, Set, Tuple
+
+import cv2
+import numpy as np
+from PIL import Image, ImageDraw
 
 
 # ============================================================================
@@ -28,741 +45,869 @@ import colorsys
 # ============================================================================
 
 class Config:
-    INPUT_DIR = Path("datasets/rsicd_images")
-    OUTPUT_DIR = Path("outputs/enriched_captions")
-    
-    # M2B Parameters
-    EDGE_THRESHOLD = 30  # For edge detection sensitivity
-    MIN_REGION_AREA = 500  # Minimum pixels for a valid region
-    MAX_REGIONS = 15  # Maximum regions to analyze per image
-    GRID_SIZE = 3  # 3x3 grid for spatial analysis
-    
-    # B2C Parameters  
-    COLOR_BINS = 8  # Color histogram bins
-    TEXTURE_WINDOW = 5  # Window size for texture analysis
-    
+    """Tunables for pseudo-mask synthesis, M2B, and B2C."""
+
+    DATASET_DIR = Path("Datasets/rsicd")
+    OUTPUT_DIR = Path("Datasets/enriched_caption")
+    SPLITS = ("train", "valid", "test")
+
+    # Pseudo-mask
+    WORK_LONG_SIDE = 512
+    USE_BILATERAL = True
+    BILATERAL_D = 7
+    BILATERAL_SIGMA_COLOR = 50
+    BILATERAL_SIGMA_SPACE = 50
+    MORPH_KERNEL = 3
+
+    # M2B
+    MIN_BOX_AREA = 64
+    IGNORE_IDS: Set[int] = {0}
+
+    # B2C
+    CENTER_FRAC = 0.25
+    N_CAPTIONS = 5
+    MAX_SUBSET = 6
+    COUNT_MANY_THRESHOLD = 10
+    SEED = 0
+
     def __init__(self):
         self.OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # ============================================================================
-# COLOR ANALYSIS UTILITIES
+# COLOR VOCABULARY (kept from prior enricher)
 # ============================================================================
 
-# Remote sensing color vocabulary
 RS_COLORS = {
-    'green': {'hue_range': (60, 180), 'description': 'vegetation', 'objects': ['trees', 'grass', 'forest', 'park', 'field']},
-    'dark_green': {'hue_range': (90, 150), 'sat_min': 0.3, 'val_max': 0.5, 'description': 'dense vegetation', 'objects': ['forest', 'dense trees']},
-    'light_green': {'hue_range': (60, 120), 'sat_max': 0.5, 'val_min': 0.5, 'description': 'grass or lawn', 'objects': ['grass', 'lawn', 'field']},
-    'blue': {'hue_range': (180, 260), 'description': 'water', 'objects': ['water', 'river', 'pond', 'lake', 'pool']},
-    'dark_blue': {'hue_range': (200, 250), 'val_max': 0.4, 'description': 'deep water', 'objects': ['lake', 'river', 'ocean']},
-    'gray': {'sat_max': 0.15, 'description': 'urban/roads', 'objects': ['road', 'pavement', 'concrete', 'building roof']},
-    'dark_gray': {'sat_max': 0.15, 'val_max': 0.4, 'description': 'asphalt', 'objects': ['road', 'parking lot', 'asphalt']},
-    'light_gray': {'sat_max': 0.15, 'val_min': 0.6, 'description': 'concrete', 'objects': ['concrete', 'sidewalk', 'building']},
-    'brown': {'hue_range': (10, 40), 'description': 'bare earth', 'objects': ['bare soil', 'dirt', 'unpaved area', 'farmland']},
-    'tan': {'hue_range': (30, 50), 'val_min': 0.5, 'description': 'sand or dry ground', 'objects': ['sand', 'beach', 'desert', 'dry field']},
-    'red': {'hue_range': (0, 15), 'description': 'rooftops', 'objects': ['roof', 'building', 'structure']},
-    'orange': {'hue_range': (15, 40), 'sat_min': 0.4, 'description': 'clay roofs', 'objects': ['clay roof', 'terracotta', 'building']},
-    'white': {'val_min': 0.85, 'sat_max': 0.1, 'description': 'bright surfaces', 'objects': ['building', 'roof', 'marking', 'cloud shadow']},
-    'black': {'val_max': 0.15, 'description': 'shadows/dark areas', 'objects': ['shadow', 'dark structure']},
+    "green": {
+        "hue_range": (60, 180),
+        "description": "vegetation",
+        "objects": ["trees", "grass", "forest", "park", "field"],
+    },
+    "dark_green": {
+        "hue_range": (90, 150),
+        "sat_min": 0.3,
+        "val_max": 0.5,
+        "description": "dense vegetation",
+        "objects": ["forest", "dense trees"],
+    },
+    "light_green": {
+        "hue_range": (60, 120),
+        "sat_max": 0.5,
+        "val_min": 0.5,
+        "description": "grass or lawn",
+        "objects": ["grass", "lawn", "field"],
+    },
+    "blue": {
+        "hue_range": (180, 260),
+        "description": "water",
+        "objects": ["water", "river", "pond", "lake", "pool"],
+    },
+    "dark_blue": {
+        "hue_range": (200, 250),
+        "val_max": 0.4,
+        "description": "deep water",
+        "objects": ["lake", "river", "ocean"],
+    },
+    "gray": {
+        "sat_max": 0.15,
+        "description": "urban/roads",
+        "objects": ["road", "pavement", "concrete", "building roof"],
+    },
+    "dark_gray": {
+        "sat_max": 0.15,
+        "val_max": 0.4,
+        "description": "asphalt",
+        "objects": ["road", "parking lot", "asphalt"],
+    },
+    "light_gray": {
+        "sat_max": 0.15,
+        "val_min": 0.6,
+        "description": "concrete",
+        "objects": ["concrete", "sidewalk", "building"],
+    },
+    "brown": {
+        "hue_range": (10, 40),
+        "description": "bare earth",
+        "objects": ["bare soil", "dirt", "unpaved area", "farmland"],
+    },
+    "tan": {
+        "hue_range": (30, 50),
+        "val_min": 0.5,
+        "description": "sand or dry ground",
+        "objects": ["sand", "beach", "desert", "dry field"],
+    },
+    "red": {
+        "hue_range": (0, 15),
+        "description": "rooftops",
+        "objects": ["roof", "building", "structure"],
+    },
+    "orange": {
+        "hue_range": (15, 40),
+        "sat_min": 0.4,
+        "description": "clay roofs",
+        "objects": ["clay roof", "terracotta", "building"],
+    },
+    "white": {
+        "val_min": 0.85,
+        "sat_max": 0.1,
+        "description": "bright surfaces",
+        "objects": ["building", "roof", "marking", "cloud shadow"],
+    },
+    "black": {
+        "val_max": 0.15,
+        "description": "shadows/dark areas",
+        "objects": ["shadow", "dark structure"],
+    },
 }
 
-# Spatial position descriptions
-POSITION_NAMES = {
-    (0, 0): 'top-left', (0, 1): 'top-center', (0, 2): 'top-right',
-    (1, 0): 'middle-left', (1, 1): 'center', (1, 2): 'middle-right',
-    (2, 0): 'bottom-left', (2, 1): 'bottom-center', (2, 2): 'bottom-right'
+COLOR_TO_GROUP = {
+    "green": "vegetation",
+    "dark_green": "vegetation",
+    "light_green": "vegetation",
+    "blue": "water",
+    "dark_blue": "water",
+    "gray": "urban",
+    "dark_gray": "urban",
+    "light_gray": "urban",
+    "brown": "bare",
+    "tan": "bare",
+    "red": "built",
+    "orange": "built",
+    "white": "built",
+    "black": "shadow",
+    "mixed": "mixed",
+}
+
+# Class ids for the pseudo semantic mask (0 = background / mixed / ignore)
+GROUP_TO_ID = {
+    "mixed": 0,
+    "vegetation": 1,
+    "water": 2,
+    "urban": 3,
+    "bare": 4,
+    "built": 5,
+    "shadow": 6,
+}
+
+# Countable nouns for B2C phrasing
+GROUP_TO_NOUN = {
+    "vegetation": "patch of vegetation",
+    "water": "body of water",
+    "urban": "road",
+    "bare": "bare ground area",
+    "built": "building",
+    "shadow": "shadowed area",
+}
+
+ID_TO_NOUN = {
+    gid: GROUP_TO_NOUN[name]
+    for name, gid in GROUP_TO_ID.items()
+    if name != "mixed"
+}
+
+# Caption keyword grounding: when the original caption names a specific
+# object type, remap dominant built/urban boxes to that noun.
+CAPTION_SCENE_CUES = [
+    (
+        ["airport", "runway", "tarmac", "apron", "aircraft", "airplane", "plane", "planes"],
+        "airport",
+        "airplane",
+    ),
+    (["highway", "motorway", "freeway", "overpass", "interchange"], "highway", "road"),
+    (["bridge", "viaduct"], "bridge", "bridge"),
+    (["railway", "railroad", "train station", "rail station"], "railway", "railway"),
+    (["parking lot", "car park", "parking"], "parking", "parking lot"),
+    (["ocean", "sea", "coast", "beach", "shore"], "coast", "coastal water"),
+    (["river", "stream", "canal"], "river", "river"),
+    (["lake", "pond", "reservoir", "harbor", "harbour", "port", "dock"], "water", "body of water"),
+    (["residential", "houses", "house", "apartment", "neighbourhood", "neighborhood"],
+     "residential", "building"),
+    (["industrial", "factory", "warehouse", "plant"], "industrial", "building"),
+    (["commercial", "shopping", "market", "downtown"], "commercial", "building"),
+    (["stadium", "arena", "sports field", "playground"], "stadium", "stadium"),
+    (["school", "university", "campus"], "campus", "building"),
+    (["forest", "woodland", "woods", "dense trees"], "forest", "patch of vegetation"),
+    (["park", "lawn", "garden", "golf"], "park", "patch of vegetation"),
+    (["farmland", "farm", "crop", "agricultural", "field", "fields", "meadow"],
+     "agricultural", "field"),
+    (["desert", "sand dune", "dune"], "desert", "bare ground area"),
+    (["ship", "ships", "boat", "boats", "vessel"], "ship", "ship"),
+    (["bare land", "bare ground", "bare soil", "naked land"], "bare", "bare ground area"),
+]
+
+# Which land-cover groups a caption cue may override
+CUE_TARGET_GROUPS = {
+    "airport": {"built", "urban", "bare"},
+    "highway": {"urban", "built"},
+    "bridge": {"urban", "built"},
+    "railway": {"urban", "built"},
+    "parking": {"urban", "built", "bare"},
+    "coast": {"water"},
+    "river": {"water"},
+    "water": {"water"},
+    "residential": {"built"},
+    "industrial": {"built"},
+    "commercial": {"built"},
+    "stadium": {"built", "bare"},
+    "campus": {"built"},
+    "forest": {"vegetation"},
+    "park": {"vegetation"},
+    "agricultural": {"vegetation", "bare"},
+    "desert": {"bare"},
+    "ship": {"built", "water"},
+    "bare": {"bare"},
 }
 
 
-def rgb_to_hsv(r: int, g: int, b: int) -> Tuple[float, float, float]:
-    """Convert RGB (0-255) to HSV (H: 0-360, S: 0-1, V: 0-1)"""
-    h, s, v = colorsys.rgb_to_hsv(r/255, g/255, b/255)
-    return h * 360, s, v
+def _rgb_array_to_hsv(rgb: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Vectorized RGB->HSV. Input (N,3) 0-255; returns H 0-360, S/V 0-1."""
+    arr = rgb.astype(np.float32) / 255.0
+    r, g, b = arr[:, 0], arr[:, 1], arr[:, 2]
+    maxc = arr.max(axis=1)
+    minc = arr.min(axis=1)
+    v = maxc
+    delta = maxc - minc
+    s = np.where(maxc > 0, delta / np.where(maxc == 0, 1.0, maxc), 0.0)
+    safe_delta = np.where(delta == 0, 1.0, delta)
+    rc = (maxc - r) / safe_delta
+    gc = (maxc - g) / safe_delta
+    bc = (maxc - b) / safe_delta
+    h = np.where(
+        r == maxc,
+        bc - gc,
+        np.where(g == maxc, 2.0 + rc - bc, 4.0 + gc - rc),
+    )
+    h = (h / 6.0) % 1.0
+    h = np.where(delta == 0, 0.0, h)
+    return h * 360.0, s, v
 
 
-def classify_color(r: int, g: int, b: int) -> Tuple[str, str, List[str]]:
+def classify_colors_array(rgb: np.ndarray) -> np.ndarray:
     """
-    Classify an RGB color into remote sensing categories.
-    Returns: (color_name, description, possible_objects)
+    Vectorized color classification matching RS_COLORS order (first match wins).
+    Input rgb: (N, 3) uint8. Returns (N,) object array of color-name strings.
     """
-    h, s, v = rgb_to_hsv(r, g, b)
-    
-    # Check specific colors first (more restrictive)
+    n = rgb.shape[0]
+    h, s, v = _rgb_array_to_hsv(rgb)
+    names = np.full(n, "mixed", dtype=object)
+    assigned = np.zeros(n, dtype=bool)
+
     for color_name, props in RS_COLORS.items():
-        match = True
-        
-        # Check hue range if specified
-        if 'hue_range' in props:
-            h_min, h_max = props['hue_range']
-            if not (h_min <= h <= h_max):
-                match = False
-        
-        # Check saturation constraints
-        if 'sat_min' in props and s < props['sat_min']:
-            match = False
-        if 'sat_max' in props and s > props['sat_max']:
-            match = False
-            
-        # Check value (brightness) constraints
-        if 'val_min' in props and v < props['val_min']:
-            match = False
-        if 'val_max' in props and v > props['val_max']:
-            match = False
-        
-        if match:
-            return color_name, props['description'], props['objects']
-    
-    # Default fallback
-    return 'mixed', 'mixed terrain', ['terrain', 'land']
+        match = np.ones(n, dtype=bool)
+        if "hue_range" in props:
+            h_min, h_max = props["hue_range"]
+            match &= (h >= h_min) & (h <= h_max)
+        if "sat_min" in props:
+            match &= s >= props["sat_min"]
+        if "sat_max" in props:
+            match &= s <= props["sat_max"]
+        if "val_min" in props:
+            match &= v >= props["val_min"]
+        if "val_max" in props:
+            match &= v <= props["val_max"]
+        take = match & ~assigned
+        names[take] = color_name
+        assigned |= take
+
+    return names
 
 
-# ============================================================================
-# M2B: MASK TO BOX - Region Detection
-# ============================================================================
+def extract_caption_cues(text: str) -> Dict:
+    """Keyword-only scene cues from an original caption (no ML)."""
+    empty = {
+        "scene_tag": None,
+        "object_noun": None,
+        "matched_keywords": [],
+    }
+    if not text or not text.strip():
+        return empty
 
-class MaskToBox:
-    """
-    M2B: Detects regions in aerial images using image processing.
-    No ML models - uses edge detection, thresholding, and contour analysis.
-    """
-    
-    def __init__(self, config: Config):
-        self.config = config
-    
-    def detect_edges(self, image: Image.Image) -> Image.Image:
-        """Detect edges using PIL filters (Sobel-like)"""
-        # Convert to grayscale
-        gray = image.convert('L')
-        
-        # Apply edge detection
-        edges = gray.filter(ImageFilter.FIND_EDGES)
-        
-        # Enhance edges
-        edges = edges.filter(ImageFilter.EDGE_ENHANCE_MORE)
-        
-        return edges
-    
-    def threshold_image(self, image: Image.Image, threshold: int = 128) -> np.ndarray:
-        """Convert image to binary mask"""
-        gray = image.convert('L')
-        arr = np.array(gray)
-        binary = (arr > threshold).astype(np.uint8) * 255
-        return binary
-    
-    def find_regions_grid(self, image: Image.Image) -> List[Dict]:
-        """
-        Divide image into grid and analyze each cell.
-        Returns list of region dictionaries with bounding boxes.
-        """
-        width, height = image.size
-        regions = []
-        
-        cell_w = width // self.config.GRID_SIZE
-        cell_h = height // self.config.GRID_SIZE
-        
-        for row in range(self.config.GRID_SIZE):
-            for col in range(self.config.GRID_SIZE):
-                # Calculate bounding box
-                x1 = col * cell_w
-                y1 = row * cell_h
-                x2 = min((col + 1) * cell_w, width)
-                y2 = min((row + 1) * cell_h, height)
-                
-                # Crop region
-                region_img = image.crop((x1, y1, x2, y2))
-                
-                regions.append({
-                    'id': row * self.config.GRID_SIZE + col,
-                    'bbox': (x1, y1, x2, y2),
-                    'position': POSITION_NAMES.get((row, col), 'unknown'),
-                    'grid_pos': (row, col),
-                    'image': region_img,
-                    'area': (x2 - x1) * (y2 - y1)
-                })
-        
-        return regions
-    
-    def find_regions_adaptive(self, image: Image.Image) -> List[Dict]:
-        """
-        Find regions using color-based segmentation.
-        Groups similar colored areas into regions.
-        """
-        # Quantize colors to find dominant regions
-        quantized = image.quantize(colors=16, method=Image.Quantize.MEDIANCUT)
-        quantized_rgb = quantized.convert('RGB')
-        
-        arr = np.array(quantized_rgb)
-        height, width = arr.shape[:2]
-        
-        # Find unique colors and their pixel locations
-        pixels = arr.reshape(-1, 3)
-        unique_colors, inverse, counts = np.unique(
-            pixels, axis=0, return_inverse=True, return_counts=True
-        )
-        
-        regions = []
-        inverse_2d = inverse.reshape(height, width)
-        
-        for idx, (color, count) in enumerate(zip(unique_colors, counts)):
-            if count < self.config.MIN_REGION_AREA:
-                continue
-            
-            # Find bounding box of this color
-            mask = (inverse_2d == idx)
-            rows = np.any(mask, axis=1)
-            cols = np.any(mask, axis=0)
-            
-            if not rows.any() or not cols.any():
-                continue
-                
-            y1, y2 = np.where(rows)[0][[0, -1]]
-            x1, x2 = np.where(cols)[0][[0, -1]]
-            
-            # Determine grid position
-            center_x = (x1 + x2) // 2
-            center_y = (y1 + y2) // 2
-            grid_row = min(center_y * self.config.GRID_SIZE // height, self.config.GRID_SIZE - 1)
-            grid_col = min(center_x * self.config.GRID_SIZE // width, self.config.GRID_SIZE - 1)
-            
-            region_img = image.crop((x1, y1, x2 + 1, y2 + 1))
-            
-            regions.append({
-                'id': idx,
-                'bbox': (int(x1), int(y1), int(x2 + 1), int(y2 + 1)),
-                'position': POSITION_NAMES.get((grid_row, grid_col), 'center'),
-                'grid_pos': (grid_row, grid_col),
-                'image': region_img,
-                'area': int(count),
-                'dominant_color': tuple(color.tolist()),
-                'coverage': count / (width * height)
-            })
-        
-        # Sort by area (largest first) and limit
-        regions.sort(key=lambda x: x['area'], reverse=True)
-        return regions[:self.config.MAX_REGIONS]
-    
-    def extract_regions(self, image: Image.Image, method: str = 'hybrid') -> List[Dict]:
-        """
-        Main M2B function: Extract regions from image.
-        
-        Methods:
-        - 'grid': Simple grid-based division
-        - 'adaptive': Color-based segmentation  
-        - 'hybrid': Combines both approaches
-        """
-        if method == 'grid':
-            return self.find_regions_grid(image)
-        elif method == 'adaptive':
-            return self.find_regions_adaptive(image)
-        else:  # hybrid
-            grid_regions = self.find_regions_grid(image)
-            adaptive_regions = self.find_regions_adaptive(image)
-            
-            # Merge: use grid for structure, adaptive for details
-            return grid_regions + adaptive_regions[:5]
+    lower = re.sub(r"[^a-z0-9\s\-]", " ", text.lower())
+    lower = re.sub(r"\s+", " ", lower).strip()
 
-
-# ============================================================================
-# B2C: BOX TO CAPTION - Region Description
-# ============================================================================
-
-class BoxToCaption:
-    """
-    B2C: Generates text descriptions for image regions.
-    Uses color analysis, texture features, and spatial relationships.
-    """
-    
-    def __init__(self, config: Config):
-        self.config = config
-    
-    def analyze_colors(self, image: Image.Image) -> Dict:
-        """Analyze color distribution in a region"""
-        # Resize for faster processing
-        thumb = image.copy()
-        thumb.thumbnail((64, 64))
-        
-        pixels = list(thumb.getdata())
-        
-        if not pixels:
-            return {'dominant': 'unknown', 'description': 'unknown area', 'objects': []}
-        
-        # Analyze color distribution
-        color_counts = Counter()
-        color_details = []
-        
-        for r, g, b in pixels[:1000]:  # Sample up to 1000 pixels
-            color_name, desc, objects = classify_color(r, g, b)
-            color_counts[color_name] += 1
-            color_details.append((color_name, desc, objects))
-        
-        # Get dominant color
-        if color_counts:
-            dominant = color_counts.most_common(1)[0][0]
-            dominant_info = RS_COLORS.get(dominant, {'description': 'mixed', 'objects': ['terrain']})
-        else:
-            dominant = 'unknown'
-            dominant_info = {'description': 'unknown', 'objects': []}
-        
-        # Calculate color diversity
-        total = sum(color_counts.values())
-        diversity = len([c for c, cnt in color_counts.items() if cnt/total > 0.1])
-        
-        return {
-            'dominant': dominant,
-            'description': dominant_info.get('description', 'unknown'),
-            'objects': dominant_info.get('objects', []),
-            'color_counts': dict(color_counts),
-            'diversity': diversity,
-            'is_uniform': diversity <= 2,
-            'is_mixed': diversity > 3
-        }
-    
-    def analyze_texture(self, image: Image.Image) -> Dict:
-        """Analyze texture characteristics (smoothness, patterns)"""
-        gray = image.convert('L')
-        
-        # Resize for analysis
-        thumb = gray.copy()
-        thumb.thumbnail((64, 64))
-        arr = np.array(thumb, dtype=np.float32)
-        
-        if arr.size == 0:
-            return {'smoothness': 0, 'complexity': 'unknown'}
-        
-        # Calculate local variance (texture measure)
-        local_mean = np.zeros_like(arr)
-        local_var = np.zeros_like(arr)
-        
-        window = self.config.TEXTURE_WINDOW
-        pad = window // 2
-        
-        # Simple variance calculation
-        variance = np.var(arr)
-        mean_val = np.mean(arr)
-        
-        # Edge density (complexity)
-        edges = gray.filter(ImageFilter.FIND_EDGES)
-        edge_arr = np.array(edges.resize((64, 64)))
-        edge_density = np.mean(edge_arr) / 255
-        
-        # Classify texture
-        if variance < 500:
-            smoothness = 'smooth'
-            texture_type = 'uniform surface'
-        elif variance < 2000:
-            smoothness = 'medium'
-            texture_type = 'textured surface'
-        else:
-            smoothness = 'rough'
-            texture_type = 'complex texture'
-        
-        if edge_density < 0.1:
-            complexity = 'simple'
-        elif edge_density < 0.3:
-            complexity = 'moderate'
-        else:
-            complexity = 'complex'
-        
-        return {
-            'smoothness': smoothness,
-            'complexity': complexity,
-            'texture_type': texture_type,
-            'variance': float(variance),
-            'edge_density': float(edge_density),
-            'brightness': float(mean_val / 255)
-        }
-    
-    def analyze_shape(self, bbox: Tuple[int, int, int, int], image_size: Tuple[int, int]) -> Dict:
-        """Analyze shape and spatial characteristics of a region"""
-        x1, y1, x2, y2 = bbox
-        width = x2 - x1
-        height = y2 - y1
-        img_w, img_h = image_size
-        
-        # Aspect ratio
-        aspect = width / max(height, 1)
-        
-        # Relative size
-        rel_area = (width * height) / (img_w * img_h)
-        
-        # Shape classification
-        if 0.8 <= aspect <= 1.2:
-            shape = 'square'
-        elif aspect > 2:
-            shape = 'horizontal strip'
-        elif aspect < 0.5:
-            shape = 'vertical strip'
-        else:
-            shape = 'rectangular'
-        
-        # Size classification
-        if rel_area > 0.3:
-            size = 'large'
-        elif rel_area > 0.1:
-            size = 'medium'
-        else:
-            size = 'small'
-        
-        return {
-            'shape': shape,
-            'size': size,
-            'aspect_ratio': aspect,
-            'relative_area': rel_area,
-            'width': width,
-            'height': height
-        }
-    
-    def generate_region_caption(self, region: Dict, image_size: Tuple[int, int]) -> str:
-        """Generate a natural language caption for a single region"""
-        
-        # Analyze the region
-        color_info = self.analyze_colors(region['image'])
-        texture_info = self.analyze_texture(region['image'])
-        shape_info = self.analyze_shape(region['bbox'], image_size)
-        
-        # Build caption components
-        parts = []
-        
-        # Position
-        position = region.get('position', 'center')
-        
-        # Main object/feature
-        objects = color_info.get('objects', ['area'])
-        main_object = objects[0] if objects else 'area'
-        
-        # Size modifier
-        size = shape_info.get('size', 'medium')
-        
-        # Texture modifier
-        texture = texture_info.get('smoothness', 'textured')
-        
-        # Build description
-        if color_info.get('is_uniform', False):
-            desc = f"{size} {color_info['description']} area"
-        else:
-            desc = f"{size} {texture} {main_object}"
-        
-        # Add position if not center
-        if position != 'center':
-            caption = f"{desc} in the {position}"
-        else:
-            caption = f"{desc} in the center"
-        
-        # Store analysis for reference
-        region['color_analysis'] = color_info
-        region['texture_analysis'] = texture_info
-        region['shape_analysis'] = shape_info
-        region['caption'] = caption
-        
-        return caption
-    
-    def describe_regions(self, regions: List[Dict], image_size: Tuple[int, int]) -> List[str]:
-        """Generate captions for all regions"""
-        captions = []
-        for region in regions:
-            caption = self.generate_region_caption(region, image_size)
-            captions.append(caption)
-        return captions
-
-
-# ============================================================================
-# CAPTION ENRICHMENT ENGINE
-# ============================================================================
-
-class CaptionEnricher:
-    """
-    Main class that combines M2B and B2C to enrich captions.
-    """
-    
-    def __init__(self, config: Config = None):
-        self.config = config or Config()
-        self.m2b = MaskToBox(self.config)
-        self.b2c = BoxToCaption(self.config)
-    
-    def enrich_caption(self, image_path: str, original_caption: str = "") -> Dict:
-        """
-        Enrich a caption for a single image.
-        
-        Returns dict with:
-        - original_caption: Input caption
-        - enriched_caption: Enhanced caption with region details
-        - regions: List of detected regions with their descriptions
-        - scene_analysis: Overall scene analysis
-        """
-        # Load image
-        image = Image.open(image_path).convert('RGB')
-        image_size = image.size
-        
-        # M2B: Extract regions
-        regions = self.m2b.extract_regions(image, method='hybrid')
-        
-        # B2C: Generate region captions
-        region_captions = self.b2c.describe_regions(regions, image_size)
-        
-        # Analyze overall scene
-        scene_analysis = self._analyze_scene(regions, image)
-        
-        # Combine into enriched caption
-        enriched = self._compose_enriched_caption(
-            original_caption, region_captions, scene_analysis
-        )
-        
-        return {
-            'image_path': str(image_path),
-            'original_caption': original_caption,
-            'enriched_caption': enriched,
-            'region_count': len(regions),
-            'regions': [
-                {
-                    'id': r['id'],
-                    'position': r['position'],
-                    'bbox': r['bbox'],
-                    'caption': r.get('caption', ''),
-                    'color': r.get('color_analysis', {}).get('dominant', 'unknown'),
-                    'area': r.get('area', 0)
-                }
-                for r in regions
-            ],
-            'scene_analysis': scene_analysis
-        }
-    
-    def _analyze_scene(self, regions: List[Dict], image: Image.Image) -> Dict:
-        """Analyze overall scene characteristics"""
-        # Collect all color analyses
-        all_colors = Counter()
-        all_objects = []
-        
-        for region in regions:
-            if 'color_analysis' in region:
-                for color, count in region['color_analysis'].get('color_counts', {}).items():
-                    all_colors[color] += count
-                all_objects.extend(region['color_analysis'].get('objects', []))
-        
-        # Determine scene type
-        green_pct = (all_colors.get('green', 0) + all_colors.get('dark_green', 0) + 
-                    all_colors.get('light_green', 0))
-        gray_pct = (all_colors.get('gray', 0) + all_colors.get('dark_gray', 0) + 
-                   all_colors.get('light_gray', 0))
-        blue_pct = all_colors.get('blue', 0) + all_colors.get('dark_blue', 0)
-        brown_pct = all_colors.get('brown', 0) + all_colors.get('tan', 0)
-        
-        total = sum(all_colors.values()) or 1
-        
-        # Classify scene
-        if green_pct / total > 0.5:
-            scene_type = 'vegetation-dominant'
-            scene_desc = 'area with abundant vegetation'
-        elif gray_pct / total > 0.4:
-            scene_type = 'urban'
-            scene_desc = 'urban or developed area'
-        elif blue_pct / total > 0.3:
-            scene_type = 'water'
-            scene_desc = 'area with water bodies'
-        elif brown_pct / total > 0.4:
-            scene_type = 'agricultural'
-            scene_desc = 'agricultural or bare land area'
-        else:
-            scene_type = 'mixed'
-            scene_desc = 'mixed land use area'
-        
-        # Get unique objects
-        unique_objects = list(set(all_objects))[:10]
-        
-        return {
-            'scene_type': scene_type,
-            'scene_description': scene_desc,
-            'dominant_colors': dict(all_colors.most_common(5)),
-            'detected_features': unique_objects,
-            'color_distribution': {
-                'vegetation': green_pct / total,
-                'urban': gray_pct / total,
-                'water': blue_pct / total,
-                'bare_land': brown_pct / total
+    for keywords, tag, noun in CAPTION_SCENE_CUES:
+        hits = [kw for kw in keywords if kw in lower]
+        if hits:
+            return {
+                "scene_tag": tag,
+                "object_noun": noun,
+                "matched_keywords": hits,
             }
+    return empty
+
+
+def normalize_label(name: str) -> str:
+    """Normalize category names into readable text (large-vehicle -> large vehicle)."""
+    return name.replace("-", " ").replace("_", " ").strip().lower()
+
+
+# ============================================================================
+# 1. PSEUDO MASK GENERATOR
+# ============================================================================
+
+class PseudoMaskGenerator:
+    """
+    Synthesize an approximate semantic segmentation mask from RGB
+    using color land-cover classification + morphology (no ML).
+    """
+
+    def __init__(self, config: Config):
+        self.config = config
+
+    def generate(
+        self, image: Image.Image
+    ) -> Tuple[np.ndarray, Dict[int, str], float, float]:
+        """
+        Returns:
+            mask: HxW uint8 class ids at working resolution
+            class_id_to_name: id -> countable noun
+            scale_x, scale_y: factors to map work coords -> original (orig = work * scale)
+        """
+        orig_w, orig_h = image.size
+        work = image.convert("RGB")
+        long_side = max(orig_w, orig_h)
+        if long_side > self.config.WORK_LONG_SIDE:
+            scale = self.config.WORK_LONG_SIDE / float(long_side)
+            new_w = max(1, int(round(orig_w * scale)))
+            new_h = max(1, int(round(orig_h * scale)))
+            resample = getattr(Image, "Resampling", Image).BILINEAR
+            work = work.resize((new_w, new_h), resample)
+        else:
+            new_w, new_h = orig_w, orig_h
+
+        scale_x = orig_w / float(new_w)
+        scale_y = orig_h / float(new_h)
+
+        rgb = np.asarray(work, dtype=np.uint8)
+        if self.config.USE_BILATERAL:
+            rgb = cv2.bilateralFilter(
+                rgb,
+                d=self.config.BILATERAL_D,
+                sigmaColor=self.config.BILATERAL_SIGMA_COLOR,
+                sigmaSpace=self.config.BILATERAL_SIGMA_SPACE,
+            )
+
+        flat = rgb.reshape(-1, 3)
+        color_names = classify_colors_array(flat)
+        groups = np.array(
+            [COLOR_TO_GROUP.get(n, "mixed") for n in color_names.tolist()],
+            dtype=object,
+        )
+        mask = np.array(
+            [GROUP_TO_ID.get(g, 0) for g in groups.tolist()],
+            dtype=np.uint8,
+        ).reshape(new_h, new_w)
+
+        # Morphological cleanup per class (skip background)
+        k = max(1, int(self.config.MORPH_KERNEL))
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+        cleaned = np.zeros_like(mask)
+        for gid in ID_TO_NOUN:
+            binary = (mask == gid).astype(np.uint8)
+            binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+            binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+            cleaned[binary > 0] = gid
+
+        return cleaned, dict(ID_TO_NOUN), scale_x, scale_y
+
+
+# ============================================================================
+# 2. M2B: MASK → BOXES
+# ============================================================================
+
+def mask_to_boxes(
+    mask: np.ndarray,
+    class_id_to_name: Dict[int, str],
+    ignore_ids: Optional[Set[int]] = None,
+    min_box_area: int = 64,
+    scale_x: float = 1.0,
+    scale_y: float = 1.0,
+) -> List[Dict]:
+    """
+    Paper M2B: for each semantic class, extract external contours
+    (Suzuki border-following via OpenCV), take axis-aligned bounding rect.
+
+    mask: HxW int class ids (semantic). Each connected region of a class
+    becomes one box; adjacent same-class objects merge (paper caveat).
+    """
+    ignore_ids = ignore_ids if ignore_ids is not None else {0}
+    boxes: List[Dict] = []
+
+    for class_id, class_name in class_id_to_name.items():
+        if class_id in ignore_ids:
+            continue
+        binary = (mask == class_id).astype(np.uint8)
+        contours, _ = cv2.findContours(
+            binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        label = normalize_label(class_name)
+        for contour in contours:
+            x, y, w, h = cv2.boundingRect(contour)
+            if w * h < min_box_area:
+                continue
+            x1 = int(round(x * scale_x))
+            y1 = int(round(y * scale_y))
+            x2 = int(round((x + w) * scale_x))
+            y2 = int(round((y + h) * scale_y))
+            boxes.append({"label": label, "bbox_xyxy": [x1, y1, x2, y2]})
+
+    return boxes
+
+
+# ============================================================================
+# 3. B2C: BOXES → CAPTIONS
+# ============================================================================
+
+def count_phrase(n: int, label: str, many_threshold: int = 10) -> str:
+    """Exact count unless n > threshold -> broad phrase ('many')."""
+    # Labels that already contain "patch of" / "body of" / "area" stay as-is
+    # for pluralization; simple nouns get a trailing 's'.
+    if n > many_threshold:
+        return f"many {_pluralize(label)}"
+    if n == 1:
+        return f"one {label}"
+    return f"{n} {_pluralize(label)}"
+
+
+_IRREGULAR_PLURALS = {
+    "body of water": "bodies of water",
+    "patch of vegetation": "patches of vegetation",
+    "bare ground area": "bare ground areas",
+    "shadowed area": "shadowed areas",
+    "parking lot": "parking lots",
+}
+
+
+def _pluralize(label: str) -> str:
+    if label in _IRREGULAR_PLURALS:
+        return _IRREGULAR_PLURALS[label]
+    if label.endswith("s"):
+        return label
+    if label.endswith(" area"):
+        return label + "s"
+    if " of " in label:
+        # "X of Y" -> pluralize the head noun
+        head, rest = label.split(" of ", 1)
+        return f"{_pluralize(head)} of {rest}"
+    if label.endswith("y") and not label.endswith(("ay", "ey", "oy", "uy")):
+        return label[:-1] + "ies"
+    return label + "s"
+
+
+def summarize(
+    items: Sequence[str], many_threshold: int = 10
+) -> str:
+    counts = Counter(items)
+    return ", ".join(
+        count_phrase(n, label, many_threshold) for label, n in counts.items()
+    )
+
+
+def boxes_to_captions(
+    boxes: List[Dict],
+    image_w: int,
+    image_h: int,
+    n_captions: int = 5,
+    center_frac: float = 0.25,
+    max_subset: int = 6,
+    many_threshold: int = 10,
+    seed: Optional[int] = 0,
+) -> List[str]:
+    """
+    RemoteCLIP B2C: up to 2 spatial captions (center / away) plus random
+    object-subset captions, totaling exactly n_captions strings.
+    """
+    rng = random.Random(seed)
+    cx0, cy0 = image_w / 2.0, image_h / 2.0
+
+    central: List[str] = []
+    peripheral: List[str] = []
+    all_labs: List[str] = []
+
+    for box in boxes:
+        x1, y1, x2, y2 = box["bbox_xyxy"]
+        cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        lab = normalize_label(box["label"])
+        all_labs.append(lab)
+        if abs(cx - cx0) < center_frac * image_w and abs(cy - cy0) < center_frac * image_h:
+            central.append(lab)
+        else:
+            peripheral.append(lab)
+
+    captions: List[str] = []
+    if central:
+        captions.append(
+            f"In the center of the image, there are {summarize(central, many_threshold)}."
+        )
+    if peripheral:
+        captions.append(
+            f"Away from the center, there are {summarize(peripheral, many_threshold)}."
+        )
+
+    while len(captions) < n_captions and all_labs:
+        k = rng.randint(1, min(len(all_labs), max_subset))
+        sample = rng.sample(all_labs, k)
+        captions.append(
+            f"The image contains {summarize(sample, many_threshold)}."
+        )
+
+    while len(captions) < n_captions:
+        if all_labs:
+            captions.append(
+                f"The image contains {summarize(all_labs, many_threshold)}."
+            )
+        else:
+            captions.append("An aerial remote sensing image.")
+
+    return captions[:n_captions]
+
+
+# ============================================================================
+# LABEL GROUNDING FROM CAPTION KEYWORDS
+# ============================================================================
+
+def ground_box_labels(
+    boxes: List[Dict],
+    caption: str,
+    mask: Optional[np.ndarray] = None,
+) -> List[Dict]:
+    """
+    Optionally remap box labels using caption keywords.
+    e.g. caption mentions airplanes -> built/urban boxes near airports
+    become 'airplane' when the cue targets those groups.
+    """
+    cues = extract_caption_cues(caption)
+    tag = cues.get("scene_tag")
+    noun = cues.get("object_noun")
+    if not tag or not noun:
+        return boxes
+
+    targets = CUE_TARGET_GROUPS.get(tag)
+    if not targets:
+        return boxes
+
+    # Invert GROUP_TO_NOUN for matching current labels
+    noun_to_group = {normalize_label(v): k for k, v in GROUP_TO_NOUN.items()}
+    grounded = []
+    for box in boxes:
+        lab = normalize_label(box["label"])
+        group = noun_to_group.get(lab)
+        if group in targets:
+            grounded.append({"label": normalize_label(noun), "bbox_xyxy": box["bbox_xyxy"]})
+        else:
+            grounded.append(box)
+    return grounded
+
+
+# ============================================================================
+# PIPELINE ENGINE
+# ============================================================================
+
+class M2BB2CPipeline:
+    """End-to-end: RGB (+ optional caption) -> 5 B2C captions + boxes."""
+
+    def __init__(self, config: Optional[Config] = None):
+        self.config = config or Config()
+        self.masker = PseudoMaskGenerator(self.config)
+
+    def process_image(
+        self,
+        image_path: str,
+        original_caption: str = "",
+        seed: Optional[int] = None,
+    ) -> Dict:
+        image = Image.open(image_path).convert("RGB")
+        img_w, img_h = image.size
+
+        mask, class_map, scale_x, scale_y = self.masker.generate(image)
+        boxes = mask_to_boxes(
+            mask,
+            class_map,
+            ignore_ids=self.config.IGNORE_IDS,
+            min_box_area=self.config.MIN_BOX_AREA,
+            scale_x=scale_x,
+            scale_y=scale_y,
+        )
+        if original_caption:
+            boxes = ground_box_labels(boxes, original_caption)
+
+        use_seed = self.config.SEED if seed is None else seed
+        captions = boxes_to_captions(
+            boxes,
+            img_w,
+            img_h,
+            n_captions=self.config.N_CAPTIONS,
+            center_frac=self.config.CENTER_FRAC,
+            max_subset=self.config.MAX_SUBSET,
+            many_threshold=self.config.COUNT_MANY_THRESHOLD,
+            seed=use_seed,
+        )
+
+        return {
+            "image_path": str(image_path),
+            "original_caption": original_caption,
+            "captions": captions,
+            "boxes": boxes,
+            "box_count": len(boxes),
+            "caption_cues": extract_caption_cues(original_caption),
         }
-    
-    def _compose_enriched_caption(self, original: str, region_captions: List[str], 
-                                   scene_analysis: Dict) -> str:
-        """Compose the final enriched caption"""
-        parts = []
-        
-        # Start with scene description
-        scene_desc = scene_analysis.get('scene_description', 'aerial view')
-        parts.append(f"This aerial image shows a {scene_desc}.")
-        
-        # Add original caption if provided
-        if original and original.strip():
-            # Clean up original
-            orig_clean = original.strip()
-            if not orig_clean.endswith('.'):
-                orig_clean += '.'
-            parts.append(orig_clean)
-        
-        # Group regions by position for coherent description
-        position_groups = {}
-        for caption in region_captions[:9]:  # Limit to grid regions
-            # Extract position from caption
-            for pos in POSITION_NAMES.values():
-                if pos in caption:
-                    if pos not in position_groups:
-                        position_groups[pos] = []
-                    position_groups[pos].append(caption)
-                    break
-        
-        # Add notable features
-        features = scene_analysis.get('detected_features', [])[:5]
-        if features:
-            feature_str = ', '.join(features[:-1])
-            if len(features) > 1:
-                feature_str += f' and {features[-1]}'
-            else:
-                feature_str = features[0]
-            parts.append(f"Notable features include {feature_str}.")
-        
-        # Add spatial descriptions (select most informative)
-        spatial_descs = []
-        for pos, captions in list(position_groups.items())[:3]:
-            if captions:
-                spatial_descs.append(captions[0])
-        
-        if spatial_descs:
-            parts.append(' '.join(spatial_descs[:2]))
-        
-        return ' '.join(parts)
-    
-    def process_dataset(self, image_dir: str = None, output_file: str = None,
-                        original_captions: Dict[str, str] = None) -> List[Dict]:
+
+    def process_split(
+        self,
+        split: str,
+        dataset_dir: Path,
+        output_dir: Path,
+        max_images: Optional[int] = None,
+        rich: bool = False,
+    ) -> Path:
         """
-        Process entire dataset and enrich captions.
-        
-        Args:
-            image_dir: Directory containing images
-            output_file: Output JSON file path
-            original_captions: Dict mapping image filename to original caption
+        Read <dataset_dir>/<split>.jsonl, write OpenCLIP-style pairs to
+        <output_dir>/<split>.jsonl (5 lines per image). Crash-safe incremental write.
+        If rich=True, also write <output_dir>/<split>_rich.jsonl with boxes.
         """
-        image_dir = Path(image_dir or self.config.INPUT_DIR)
-        output_file = output_file or str(self.config.OUTPUT_DIR / "enriched_captions.json")
-        original_captions = original_captions or {}
-        
-        results = []
-        
-        # Find all images
-        image_extensions = {'.jpg', '.jpeg', '.png', '.tif', '.tiff'}
-        images = [f for f in image_dir.iterdir() 
-                  if f.suffix.lower() in image_extensions]
-        
-        print(f"\n{'='*60}")
-        print("M2B + B2C Caption Enrichment Pipeline")
-        print(f"{'='*60}")
-        print(f"Input directory: {image_dir}")
-        print(f"Found {len(images)} images")
-        print(f"Output: {output_file}")
-        print(f"{'='*60}\n")
-        
-        for idx, img_path in enumerate(images):
-            print(f"[{idx+1}/{len(images)}] Processing: {img_path.name}")
-            
-            try:
-                # Get original caption if available
-                orig_caption = original_captions.get(img_path.name, "")
-                
-                # Enrich caption
-                result = self.enrich_caption(str(img_path), orig_caption)
-                results.append(result)
-                
-                print(f"  ✓ Enriched: {result['enriched_caption'][:80]}...")
-                print(f"  ✓ Detected {result['region_count']} regions")
-                
-            except Exception as e:
-                print(f"  ✗ Error: {e}")
-                results.append({
-                    'image_path': str(img_path),
-                    'error': str(e)
-                })
-        
-        # Save results
-        with open(output_file, 'w', encoding='utf-8') as f:
-            json.dump(results, f, indent=2, ensure_ascii=False)
-        
-        print(f"\n{'='*60}")
-        print(f"✓ Processed {len(results)} images")
-        print(f"✓ Results saved to: {output_file}")
-        print(f"{'='*60}")
-        
-        return results
+        dataset_dir = Path(dataset_dir)
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+        src_jsonl = dataset_dir / f"{split}.jsonl"
+        out_jsonl = output_dir / f"{split}.jsonl"
+        rich_jsonl = output_dir / f"{split}_rich.jsonl"
+
+        if not src_jsonl.exists():
+            print(f"  ✗ Skipping '{split}': {src_jsonl} not found")
+            return out_jsonl
+
+        entries = []
+        with open(src_jsonl, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if line:
+                    entries.append(json.loads(line))
+
+        if max_images is not None:
+            entries = entries[:max_images]
+
+        print(f"\n{'=' * 60}")
+        print(f"Split: {split}")
+        print(f"{'=' * 60}")
+        print(f"Source jsonl : {src_jsonl}")
+        print(f"Output jsonl : {out_jsonl}")
+        print(f"Entries      : {len(entries)}")
+        print(f"{'=' * 60}\n")
+
+        ok, failed = 0, 0
+        rich_f = open(rich_jsonl, "w", encoding="utf-8") if rich else None
+        try:
+            with open(out_jsonl, "w", encoding="utf-8") as out_f:
+                for idx, entry in enumerate(entries):
+                    rel_image = entry.get("image", "")
+                    img_path = dataset_dir / rel_image
+                    orig_caption = entry.get("caption", "")
+                    # Stable per-image seed from id or index
+                    seed = entry.get("id", idx)
+
+                    try:
+                        result = self.process_image(
+                            str(img_path), orig_caption, seed=seed
+                        )
+                        for cap in result["captions"]:
+                            out_f.write(
+                                json.dumps(
+                                    {"image": rel_image, "caption": cap},
+                                    ensure_ascii=False,
+                                )
+                                + "\n"
+                            )
+                        if rich_f is not None:
+                            rich_f.write(
+                                json.dumps(
+                                    {
+                                        "id": entry.get("id", idx),
+                                        "image": rel_image,
+                                        "original_caption": orig_caption,
+                                        "captions": result["captions"],
+                                        "boxes": result["boxes"],
+                                        "box_count": result["box_count"],
+                                    },
+                                    ensure_ascii=False,
+                                )
+                                + "\n"
+                            )
+                        ok += 1
+                        if (idx + 1) % 50 == 0 or idx == 0:
+                            sample = result["captions"][0] if result["captions"] else ""
+                            print(
+                                f"  [{idx + 1}/{len(entries)}] {rel_image} "
+                                f"({result['box_count']} boxes) -> {sample[:70]}..."
+                            )
+                    except Exception as e:
+                        failed += 1
+                        print(f"  ✗ [{idx + 1}/{len(entries)}] {rel_image}: {e}")
+                        # Fall back: keep original caption once so training isn't empty
+                        fallback = orig_caption or "An aerial remote sensing image."
+                        out_f.write(
+                            json.dumps(
+                                {"image": rel_image, "caption": fallback},
+                                ensure_ascii=False,
+                            )
+                            + "\n"
+                        )
+        finally:
+            if rich_f is not None:
+                rich_f.close()
+
+        print(f"\n  ✓ {split}: {ok} ok, {failed} failed -> {out_jsonl}")
+        if rich:
+            print(f"  ✓ Rich records -> {rich_jsonl}")
+        return out_jsonl
+
+    def process_rsicd(
+        self,
+        dataset_dir: Optional[Path] = None,
+        output_dir: Optional[Path] = None,
+        splits: Optional[Tuple[str, ...]] = None,
+        max_images: Optional[int] = None,
+        rich: bool = False,
+    ) -> None:
+        dataset_dir = Path(dataset_dir or self.config.DATASET_DIR)
+        output_dir = Path(output_dir or self.config.OUTPUT_DIR)
+        splits = splits or self.config.SPLITS
+
+        print(f"\n{'#' * 60}")
+        print("RemoteCLIP M2B + B2C Caption Pipeline")
+        print(f"{'#' * 60}")
+        print(f"Dataset : {dataset_dir}")
+        print(f"Output  : {output_dir}")
+        print(f"Splits  : {', '.join(splits)}")
+
+        for split in splits:
+            self.process_split(
+                split,
+                dataset_dir,
+                output_dir,
+                max_images=max_images,
+                rich=rich,
+            )
+
+        print(f"\n{'#' * 60}")
+        print(f"✓ Done. OpenCLIP pairs in: {output_dir}")
+        print(f"{'#' * 60}")
 
 
 # ============================================================================
-# VISUALIZATION (Optional)
+# VISUALIZATION
 # ============================================================================
 
-def visualize_regions(image_path: str, regions: List[Dict], output_path: str = None):
-    """Draw detected regions on image for debugging"""
-    image = Image.open(image_path).convert('RGB')
+def visualize_boxes(
+    image_path: str,
+    boxes: List[Dict],
+    output_path: Optional[str] = None,
+) -> Image.Image:
+    """Draw M2B boxes + labels on the image for debugging."""
+    image = Image.open(image_path).convert("RGB")
     draw = ImageDraw.Draw(image)
-    
-    colors = ['red', 'blue', 'green', 'yellow', 'purple', 'orange', 'cyan', 'magenta']
-    
-    for idx, region in enumerate(regions[:len(colors)]):
-        bbox = region['bbox']
+    colors = [
+        "red", "blue", "green", "yellow", "purple",
+        "orange", "cyan", "magenta", "lime", "pink",
+    ]
+    for idx, box in enumerate(boxes):
         color = colors[idx % len(colors)]
-        draw.rectangle(bbox, outline=color, width=2)
-        
-        # Add label
-        label = f"{region.get('position', idx)}"
-        draw.text((bbox[0], bbox[1] - 15), label, fill=color)
-    
+        x1, y1, x2, y2 = box["bbox_xyxy"]
+        draw.rectangle([x1, y1, x2, y2], outline=color, width=2)
+        draw.text((x1, max(0, y1 - 12)), box.get("label", str(idx)), fill=color)
     if output_path:
         image.save(output_path)
         print(f"Visualization saved to: {output_path}")
-    
     return image
 
 
 # ============================================================================
-# MAIN ENTRY POINT
+# CLI
 # ============================================================================
 
 def main():
-    """Main entry point for caption enrichment"""
-    import argparse
-    
-    parser = argparse.ArgumentParser(description='M2B + B2C Caption Enrichment')
-    parser.add_argument('--input', '-i', default='datasets/rsicd_images',
-                        help='Input image directory')
-    parser.add_argument('--output', '-o', default='outputs/enriched_captions/results.json',
-                        help='Output JSON file')
-    parser.add_argument('--single', '-s', default=None,
-                        help='Process single image')
-    parser.add_argument('--visualize', '-v', action='store_true',
-                        help='Generate visualization images')
-    parser.add_argument('--max-images', '-m', type=int, default=None,
-                        help='Maximum number of images to process')
-    
-    args = parser.parse_args()
-    
     config = Config()
-    enricher = CaptionEnricher(config)
-    
+    parser = argparse.ArgumentParser(
+        description="RemoteCLIP-style M2B + B2C caption pipeline"
+    )
+    parser.add_argument(
+        "--dataset", "-d",
+        default=str(config.DATASET_DIR),
+        help="RSICD dataset root (contains <split>.jsonl and <split>/images)",
+    )
+    parser.add_argument(
+        "--output-dir", "-o",
+        default=str(config.OUTPUT_DIR),
+        help="Directory for OpenCLIP-style <split>.jsonl files",
+    )
+    parser.add_argument(
+        "--splits",
+        nargs="+",
+        default=list(config.SPLITS),
+        help="Which splits to process (default: train valid test)",
+    )
+    parser.add_argument(
+        "--single", "-s",
+        default=None,
+        help="Process a single image path instead of the dataset",
+    )
+    parser.add_argument(
+        "--caption",
+        default="",
+        help="Original caption for --single (optional, for label grounding)",
+    )
+    parser.add_argument(
+        "--visualize", "-v",
+        action="store_true",
+        help="Draw boxes on the image (single mode only)",
+    )
+    parser.add_argument(
+        "--max-images", "-m",
+        type=int,
+        default=None,
+        help="Maximum number of images to process per split",
+    )
+    parser.add_argument(
+        "--rich",
+        action="store_true",
+        help="Also write <split>_rich.jsonl with boxes and all captions",
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        default=config.SEED,
+        help="RNG seed for B2C random subset captions",
+    )
+
+    args = parser.parse_args()
+    config.SEED = args.seed
+    pipeline = M2BB2CPipeline(config)
+
     if args.single:
-        # Process single image
-        result = enricher.enrich_caption(args.single)
+        result = pipeline.process_image(args.single, args.caption, seed=args.seed)
         print(f"\nOriginal: {result['original_caption']}")
-        print(f"\nEnriched: {result['enriched_caption']}")
-        print(f"\nRegions detected: {result['region_count']}")
-        print(f"Scene type: {result['scene_analysis']['scene_type']}")
-        
+        print(f"Boxes   : {result['box_count']}")
+        for i, cap in enumerate(result["captions"], 1):
+            print(f"  [{i}] {cap}")
         if args.visualize:
-            vis_path = args.single.replace('.', '_regions.')
-            visualize_regions(args.single, result['regions'], vis_path)
+            stem = Path(args.single)
+            vis_path = str(stem.with_name(stem.stem + "_boxes" + stem.suffix))
+            visualize_boxes(args.single, result["boxes"], vis_path)
     else:
-        # Process dataset
-        enricher.process_dataset(
-            image_dir=args.input,
-            output_file=args.output
+        pipeline.process_rsicd(
+            dataset_dir=args.dataset,
+            output_dir=args.output_dir,
+            splits=tuple(args.splits),
+            max_images=args.max_images,
+            rich=args.rich,
         )
 
 
 if __name__ == "__main__":
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8")
+        except Exception:
+            pass
     main()

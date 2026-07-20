@@ -1,29 +1,37 @@
 #!/usr/bin/env python3
 # type: ignore
 """
-Synthetic Generation Pipeline for Remote Sensing Images
+Synthetic Generation Pipeline for Remote Sensing Images (A100 x2 build)
 
-Simplified 9-stage pipeline (Real-ESRGAN removed):
-1. (Skipped) - Real-ESRGAN removed
-2. Qwen2-VL dense scene analysis  
-3. Grounding DINO layout detection
-4. SAM segmentation
-5. Intelligent Prompt Generator
-6. Stable Diffusion generation
-7. Second-pass Qwen2-VL verification
-8. Second-pass Grounding DINO detection
-9. Second-pass SAM segmentation
-10. Final Prompt Refinement & Quality Scoring
+6-stage pipeline, tuned for 2x NVIDIA A100 (80GB) + 7 CPU cores:
+1. Qwen2.5-VL-7B dense scene analysis        (analysis_device, e.g. cuda:1)
+2. Grounding DINO layout/object detection    (analysis_device)
+3. Prompt-variant generation (N prompts)     (CPU)
+4. FLUX.1-dev / SD3.5 image generation       (gen_device, e.g. cuda:0)
+5. Qwen2.5-VL multi-caption generation       (analysis_device)
+6. Manifest & metadata assembly              (CPU)
 
-All models run sequentially on GPU with lazy loading to manage memory.
+Fan-out per source image: N_PROMPTS prompt variants -> N_PROMPTS synthetic
+images -> each image gets N_CAPTIONS distinct captions. With the default
+config (10,000 source images x 5 prompts x 5 captions) this produces
+50,000 synthetic images / 250,000 image-caption pairs.
+
+Analysis (stage 1-3, GPU1) for the *next* source image is prefetched on a
+background thread while generation + captioning (GPU0/GPU1) for the
+*current* source image runs, so both GPUs stay busy concurrently.
+
+No CPU-offload, no 8-bit quantization: both A100s have ample VRAM for
+these models running natively in bf16.
 """
 from __future__ import annotations
 
 import gc
 import json
 import os
+import random
 import time
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from datetime import datetime
 from dataclasses import dataclass, field, asdict
@@ -31,20 +39,18 @@ from typing import Dict, List, Any, Optional, Tuple
 import warnings
 warnings.filterwarnings('ignore')
 
-# Limit CPU threads to prevent overload (2 cores available)
-os.environ['OMP_NUM_THREADS'] = '2'
-os.environ['MKL_NUM_THREADS'] = '2'
-os.environ['OPENBLAS_NUM_THREADS'] = '2'
-os.environ['VECLIB_MAXIMUM_THREADS'] = '2'
-os.environ['NUMEXPR_NUM_THREADS'] = '2'
+# CPU thread defaults (overridden at runtime from SyntheticConfig.cpu_threads).
+# 7 cores available; leave 1 free for OS/IO by default.
+_DEFAULT_CPU_THREADS = "6"
+os.environ.setdefault('OMP_NUM_THREADS', _DEFAULT_CPU_THREADS)
+os.environ.setdefault('MKL_NUM_THREADS', _DEFAULT_CPU_THREADS)
+os.environ.setdefault('OPENBLAS_NUM_THREADS', _DEFAULT_CPU_THREADS)
+os.environ.setdefault('VECLIB_MAXIMUM_THREADS', _DEFAULT_CPU_THREADS)
+os.environ.setdefault('NUMEXPR_NUM_THREADS', _DEFAULT_CPU_THREADS)
 
 import torch
 import numpy as np
 from PIL import Image
-
-# Set torch threads
-torch.set_num_threads(2)
-torch.set_num_interop_threads(2)
 
 from .config import PipelineConfig
 
@@ -74,51 +80,36 @@ class DetectionResult:
 
 
 @dataclass
-class SegmentationResult:
-    """Result from SAM segmentation."""
-    masks: List[Any]
-    boundaries: List[List[Tuple[int, int]]]
-    areas: List[int]
-
-
-@dataclass
 class GeneratedPrompt:
-    """Generated prompt for Stable Diffusion."""
+    """A single generated prompt variant for the image generator."""
     full_prompt: str
     scene_component: str
     layout_component: str
     object_component: str
     style_component: str
+    variant_index: int = 0
 
 
 @dataclass
-class QualityScores:
-    """Quality assessment scores."""
-    clip_score: float
-    layout_iou: float
-    object_count_accuracy: float
-    all_checks_passed: bool
-    details: Dict[str, Any] = field(default_factory=dict)
+class GeneratedImageRecord:
+    """One generated image plus its N captions."""
+    image_id: str
+    image_path: str
+    prompt: GeneratedPrompt
+    generation_params: Dict[str, Any]
+    captions: List[str] = field(default_factory=list)
 
 
 @dataclass
 class SyntheticSample:
-    """Complete synthetic sample with all metadata."""
+    """Complete synthetic sample: one source image -> N generated images."""
     sample_id: str
     source_image_path: str
-    synthetic_image_path: str
     original_extraction: ExtractionResult
     original_detection: DetectionResult
-    original_segmentation: SegmentationResult
-    generated_prompt: GeneratedPrompt
-    generation_params: Dict[str, Any]
-    verification_extraction: ExtractionResult
-    verification_detection: DetectionResult
-    verification_segmentation: SegmentationResult
-    quality_scores: QualityScores
-    refined_caption: str
+    generated_images: List[GeneratedImageRecord] = field(default_factory=list)
     created_at: str = field(default_factory=lambda: datetime.now().isoformat())
-    pipeline_version: str = "2.0.0"
+    pipeline_version: str = "3.0.0"
 
 
 # =============================================================================
@@ -127,238 +118,225 @@ class SyntheticSample:
 
 class SyntheticGenerationPipeline:
     """
-    Synthetic Generation Pipeline with upfront model loading.
-    
-    All models are loaded at initialization and kept in memory.
-    Uses CPU offloading when needed to manage GPU memory.
+    Synthetic Generation Pipeline with upfront model loading, split across
+    two GPUs: the image generator on `gen_device`, and the VLM captioner +
+    detector on `analysis_device`. All models loaded natively in bf16 with
+    no CPU offload, since both A100s have 80GB of VRAM to spare.
     """
-    
+
     def __init__(self, config: PipelineConfig):
         self.config = config
         self.synthetic_config = config.synthetic
         self.device = torch.device(config.device if torch.cuda.is_available() else "cpu")
-        
+
+        # Resolve multi-GPU placement, degrading gracefully to a single GPU
+        n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        if n_gpus >= 2:
+            self.gen_device = torch.device(self.synthetic_config.gen_device)
+            self.analysis_device = torch.device(self.synthetic_config.analysis_device)
+        elif n_gpus == 1:
+            self.gen_device = self.device
+            self.analysis_device = self.device
+        else:
+            self.gen_device = torch.device("cpu")
+            self.analysis_device = torch.device("cpu")
+
+        # Apply CPU thread budget from config (default 6 of 7 cores)
+        torch.set_num_threads(self.synthetic_config.cpu_threads)
+        torch.set_num_interop_threads(max(1, self.synthetic_config.cpu_threads // 2))
+
         # Model references (loaded during initialization)
         self.qwen_model = None
         self.qwen_processor = None
         self.gdino_model = None
         self.gdino_processor = None
-        self.sam_model = None
-        self.sam_processor = None
         self.sd_pipeline = None
-        self.clip_model = None
-        self.clip_preprocess = None
-        self.clip_tokenizer = None
-        
+
         # Statistics
-        self.processed_count = 0
-        self.passed_count = 0
+        self.processed_count = 0  # source images processed
+        self.passed_count = 0     # synthetic images generated
         self.failed_count = 0
-        self.stage_times: Dict[str, List[float]] = {f"stage_{i}": [] for i in range(2, 11)}
-        
+        self.stage_times: Dict[str, List[float]] = {
+            f"stage_{i}": [] for i in range(1, 7)
+        }
+
         # Output paths
         self.output_root = config.output_dir.parent
         self.synthetic_dir = self.output_root / "images"
         self.metadata_dir = self.output_root / "metadata"
         self.synthetic_dir.mkdir(parents=True, exist_ok=True)
         self.metadata_dir.mkdir(parents=True, exist_ok=True)
-        
+
+        # Single background worker for analysis prefetch (keeps GPU1 busy
+        # while GPU0 generates images for the previous source image)
+        self._prefetch_executor = ThreadPoolExecutor(max_workers=1)
+
         # Load all models upfront
         self._load_all_models()
-    
+
     # =========================================================================
     # GPU Memory Management
     # =========================================================================
-    
+
     def _clear_gpu_memory(self):
-        """Aggressively clear GPU memory."""
+        """Clear GPU memory (lightweight; models stay resident on both GPUs)."""
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-            torch.cuda.synchronize()
-    
-    def _get_free_memory(self) -> float:
-        """Get free GPU memory in GB."""
-        if torch.cuda.is_available():
-            free, total = torch.cuda.mem_get_info(0)
-            return free / (1024**3)
-        return 0.0
-    
-    
+
+    def _get_free_memory(self, device: Optional[torch.device] = None) -> float:
+        """Get free GPU memory in GB for a given device (default: gen_device)."""
+        if not torch.cuda.is_available():
+            return 0.0
+        dev = device if device is not None else self.gen_device
+        idx = dev.index if dev.index is not None else 0
+        free, total = torch.cuda.mem_get_info(idx)
+        return free / (1024**3)
+
     # =========================================================================
-    # Model Loading (Upfront)
+    # Model Loading (Upfront, split across both GPUs)
     # =========================================================================
-    
+
     def _load_all_models(self):
-        """Load all models at initialization."""
+        """Load all models at initialization, placed across both GPUs."""
         print("\nLoading models (this may take a few minutes)...")
-        
-        # Load Qwen2-VL
+        print(f"  Generator device:  {self.gen_device}")
+        print(f"  Analysis device:   {self.analysis_device}")
+
         self._load_qwen()
-        
-        # Load Grounding DINO  
         self._load_grounding_dino()
-        
-        # Load SAM
-        self._load_sam()
-        
-        # Load Stable Diffusion
         self._load_stable_diffusion()
-        
+
         print(f"\n{'='*70}")
         print("SYNTHETIC PIPELINE INITIALIZED")
         print(f"{'='*70}")
-        print(f"Device: {self.device}")
-        print(f"Free GPU Memory: {self._get_free_memory():.1f} GB")
-        print("All models loaded and ready (Quality scoring disabled)")
+        print(f"Generator device: {self.gen_device} "
+              f"(Free: {self._get_free_memory(self.gen_device):.1f} GB)")
+        print(f"Analysis device:  {self.analysis_device} "
+              f"(Free: {self._get_free_memory(self.analysis_device):.1f} GB)")
+        print("All models loaded natively in bf16, no CPU offload")
         print(f"{'='*70}\n")
-    
+
     def _load_qwen(self):
-        """Load Qwen2-VL-2B model with 8-bit quantization."""
-        print(f"  Loading Qwen2-VL-2B (8-bit quantized)... (Free: {self._get_free_memory():.1f}GB)")
-        
-        # Aggressive cleanup before loading
+        """Load Qwen2.5-VL-7B (bf16, native, on analysis_device)."""
+        dtype = getattr(torch, self.synthetic_config.qwen_dtype)
+        print(f"  Loading {self.synthetic_config.qwen_model} "
+              f"({self.synthetic_config.qwen_dtype})... "
+              f"(Free: {self._get_free_memory(self.analysis_device):.1f}GB)")
+
         self._clear_gpu_memory()
-        
+
         try:
-            from transformers import Qwen2VLForConditionalGeneration, AutoProcessor, BitsAndBytesConfig
-            
+            from transformers import AutoProcessor
+            try:
+                from transformers import Qwen2_5_VLForConditionalGeneration as QwenVLModel
+            except ImportError:
+                # Fallback for older transformers without Qwen2.5-VL support
+                from transformers import Qwen2VLForConditionalGeneration as QwenVLModel
+
             self.qwen_processor = AutoProcessor.from_pretrained(
                 self.synthetic_config.qwen_model,
                 trust_remote_code=True
             )
-            
-            # 8-bit quantization config - reduces memory by ~50%
-            quantization_config = BitsAndBytesConfig(
-                load_in_8bit=True,
-                llm_int8_threshold=6.0,
-                llm_int8_has_fp16_weight=False
-            )
-            
-            self.qwen_model = Qwen2VLForConditionalGeneration.from_pretrained(
+
+            self.qwen_model = QwenVLModel.from_pretrained(
                 self.synthetic_config.qwen_model,
-                quantization_config=quantization_config,
-                device_map="auto",
+                torch_dtype=dtype,
                 trust_remote_code=True,
                 low_cpu_mem_usage=True
-            )
-            
-            # Aggressive cleanup after loading
+            ).to(self.analysis_device).eval()
+
             self._clear_gpu_memory()
-            
-            print(f"  ✓ Qwen2-VL-2B loaded (8-bit, Free: {self._get_free_memory():.1f}GB)")
+
+            print(f"  \u2713 Qwen loaded on {self.analysis_device} "
+                  f"(Free: {self._get_free_memory(self.analysis_device):.1f}GB)")
         except Exception as e:
-            print(f"  ✗ Qwen2-VL-2B failed: {e}")
+            print(f"  \u2717 Qwen load failed: {e}")
             raise
-    
+
     def _load_grounding_dino(self):
-        """Load Grounding DINO model."""
-        print(f"  Loading Grounding DINO... (Free: {self._get_free_memory():.1f}GB)")
-        
-        # Aggressive cleanup before loading
+        """Load Grounding DINO (bf16, native, on analysis_device)."""
+        dtype = getattr(torch, self.synthetic_config.gdino_dtype)
+        print(f"  Loading Grounding DINO ({self.synthetic_config.gdino_dtype})... "
+              f"(Free: {self._get_free_memory(self.analysis_device):.1f}GB)")
+
         self._clear_gpu_memory()
-        
+
         try:
             from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
-            
+
             self.gdino_processor = AutoProcessor.from_pretrained(
                 self.synthetic_config.gdino_model
             )
-            # Keep on GPU - use float32 for stable inference (matches working code)
             self.gdino_model = AutoModelForZeroShotObjectDetection.from_pretrained(
                 self.synthetic_config.gdino_model,
-                torch_dtype=torch.float32,
+                torch_dtype=dtype,
                 low_cpu_mem_usage=True
-            ).to(self.device).eval()
-            
-            # Aggressive cleanup after loading
+            ).to(self.analysis_device).eval()
+
             self._clear_gpu_memory()
-            
-            print(f"  ✓ Grounding DINO loaded (Free: {self._get_free_memory():.1f}GB)")
+
+            print(f"  \u2713 Grounding DINO loaded on {self.analysis_device} "
+                  f"(Free: {self._get_free_memory(self.analysis_device):.1f}GB)")
         except Exception as e:
-            print(f"  ✗ Grounding DINO failed: {e}")
+            print(f"  \u2717 Grounding DINO load failed: {e}")
             raise
-    
-    def _load_sam(self):
-        """Load SAM model."""
-        print(f"  Loading SAM... (Free: {self._get_free_memory():.1f}GB)")
-        
-        # Aggressive cleanup before loading SAM (multiple passes)
-        for _ in range(3):
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-                torch.cuda.synchronize()
-        
-        try:
-            from transformers import SamModel, SamProcessor
-            
-            self.sam_processor = SamProcessor.from_pretrained(
-                self.synthetic_config.sam_model
-            )
-            # Keep on GPU with float32 for compatibility (matches working code)
-            self.sam_model = SamModel.from_pretrained(
-                self.synthetic_config.sam_model,
-                torch_dtype=torch.float32,
-                low_cpu_mem_usage=True
-            ).to(self.device).eval()
-            
-            # Aggressive cleanup after loading
-            self._clear_gpu_memory()
-            
-            print(f"  ✓ SAM loaded (Free: {self._get_free_memory():.1f}GB)")
-        except Exception as e:
-            print(f"  ✗ SAM failed: {e}")
-            raise
-    
+
     def _load_stable_diffusion(self):
-        """Load Stable Diffusion 3.5 Medium."""
-        # Aggressive cleanup before loading SD
+        """Load the image generator (FLUX.1-dev or SD3.5) natively on gen_device.
+
+        No `enable_sequential_cpu_offload()` / `enable_model_cpu_offload()`:
+        those exist for <16GB GPUs and would serialize every forward pass
+        through host RAM. An A100-80GB fits these models whole, so we place
+        the pipeline on the GPU once and keep it resident.
+        """
         self._clear_gpu_memory()
-        
+        dtype = getattr(torch, self.synthetic_config.sd_dtype)
+
         try:
-            from diffusers import StableDiffusion3Pipeline
-            print(f"  Loading SD 3.5 Medium... (Free: {self._get_free_memory():.1f}GB)")
-            
-            self.sd_pipeline = StableDiffusion3Pipeline.from_pretrained(
-                self.synthetic_config.sd_model,
-                torch_dtype=torch.float16,
-                variant="fp16"
-            )
-            
-            # SD3 supports sequential CPU offload for memory efficiency
-            self.sd_pipeline.enable_sequential_cpu_offload()
-            
-            # Enable model CPU offload as alternative (optional, more aggressive)
-            # Note: SD3 doesn't support enable_vae_slicing() or enable_attention_slicing()
-            # These are only available in older SD versions (1.x, 2.x, XL)
-            
-            # Aggressive cleanup after setup
+            backend = self.synthetic_config.sd_backend
+            if backend == "flux":
+                from diffusers import FluxPipeline
+                print(f"  Loading {self.synthetic_config.sd_model} "
+                      f"({self.synthetic_config.sd_dtype})... "
+                      f"(Free: {self._get_free_memory(self.gen_device):.1f}GB)")
+                self.sd_pipeline = FluxPipeline.from_pretrained(
+                    self.synthetic_config.sd_model,
+                    torch_dtype=dtype,
+                )
+            else:
+                from diffusers import StableDiffusion3Pipeline
+                print(f"  Loading {self.synthetic_config.sd_model} "
+                      f"({self.synthetic_config.sd_dtype})... "
+                      f"(Free: {self._get_free_memory(self.gen_device):.1f}GB)")
+                self.sd_pipeline = StableDiffusion3Pipeline.from_pretrained(
+                    self.synthetic_config.sd_model,
+                    torch_dtype=dtype,
+                )
+
+            # Full native placement on a single A100 - no offloading required
+            self.sd_pipeline = self.sd_pipeline.to(self.gen_device)
+
             self._clear_gpu_memory()
-            
-            print(f"  ✓ SD 3.5 Medium loaded (Free: {self._get_free_memory():.1f}GB)")
+
+            print(f"  \u2713 Generator loaded on {self.gen_device} "
+                  f"(Free: {self._get_free_memory(self.gen_device):.1f}GB)")
         except Exception as e:
-            print(f"  ✗ SD 3.5 Medium failed: {e}")
+            print(f"  \u2717 Generator load failed: {e}")
             self.sd_pipeline = None
             raise
-    
-    
-    def _load_clip(self):
-        """Load CLIP for quality scoring - DISABLED (LoRA training mode)."""
-        # CLIP loading disabled - accepting all synthetic images for LoRA training
-        pass
-    
+
     # =========================================================================
-    # Stage 2: Qwen2-VL Scene Analysis
+    # Stage 1: Qwen2.5-VL Scene Analysis
     # =========================================================================
-    
-    def stage2_scene_analysis(self, image: Image.Image) -> ExtractionResult:
-        """Analyze image with Qwen2-VL to extract scene information."""
+
+    def stage1_scene_analysis(self, image: Image.Image) -> ExtractionResult:
+        """Analyze image with Qwen2.5-VL to extract scene information."""
         start = time.time()
-        
+
         if self.qwen_model is None:
             return self._fallback_extraction()
-        
+
         try:
             prompt = """Analyze this aerial/satellite image in detail. Provide:
 1. SCENE_TYPE: (urban/rural/industrial/residential/agricultural/water/forest/etc.)
@@ -366,69 +344,63 @@ class SyntheticGenerationPipeline:
 3. LAYOUT_DESCRIPTION: Describe the spatial arrangement and how objects are organized (e.g., "buildings arranged in grid pattern, roads forming intersection, vehicles parked along streets")
 4. KEY_FEATURES: Notable landmarks or distinctive elements"""
 
-            messages = [{
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": image},
-                    {"type": "text", "text": prompt}
-                ]
-            }]
-            
-            # Process with Qwen
-            text = self.qwen_processor.apply_chat_template(
-                messages, tokenize=False, add_generation_prompt=True
-            )
-            
-            from qwen_vl_utils import process_vision_info
-            image_inputs, video_inputs = process_vision_info(messages)
-            
-            inputs = self.qwen_processor(
-                text=[text],
-                images=image_inputs,
-                videos=video_inputs,
-                padding=True,
-                return_tensors="pt"
-            )
-            
-            # Move to device with correct dtype
-            model_device = next(self.qwen_model.parameters()).device
-            model_dtype = next(self.qwen_model.parameters()).dtype
-            
-            for k, v in inputs.items():
-                if hasattr(v, 'to'):
-                    if v.dtype in (torch.float32, torch.float64, torch.bfloat16):
-                        inputs[k] = v.to(device=model_device, dtype=model_dtype)
-                    else:
-                        inputs[k] = v.to(device=model_device)
-            
-            with torch.no_grad():
-                output_ids = self.qwen_model.generate(
-                    **inputs,
-                    max_new_tokens=self.synthetic_config.qwen_max_tokens
-                )
-            
-            response = self.qwen_processor.batch_decode(
-                output_ids[:, inputs["input_ids"].shape[1]:],
-                skip_special_tokens=True
-            )[0]
-            
-            # Delete intermediate tensors immediately
-            del output_ids, inputs
-            torch.cuda.empty_cache()
-            
+            response = self._qwen_generate(image, prompt, max_new_tokens=self.synthetic_config.qwen_max_tokens)
             result = self._parse_extraction(response)
-            
+
         except Exception as e:
-            print(f"    ⚠ Scene analysis error: {e}")
+            print(f"    \u26a0 Scene analysis error: {e}")
             result = self._fallback_extraction()
-        
-        self.stage_times["stage_2"].append(time.time() - start)
-        
-        # Cleanup GPU memory after stage
-        self._clear_gpu_memory()
-        
+
+        self.stage_times["stage_1"].append(time.time() - start)
         return result
-    
+
+    def _qwen_generate(self, image: Image.Image, prompt: str, max_new_tokens: int) -> str:
+        """Run a single-turn Qwen VLM generation for one image."""
+        messages = [{
+            "role": "user",
+            "content": [
+                {"type": "image", "image": image},
+                {"type": "text", "text": prompt}
+            ]
+        }]
+
+        text = self.qwen_processor.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+
+        from qwen_vl_utils import process_vision_info
+        image_inputs, video_inputs = process_vision_info(messages)
+
+        inputs = self.qwen_processor(
+            text=[text],
+            images=image_inputs,
+            videos=video_inputs,
+            padding=True,
+            return_tensors="pt"
+        )
+
+        model_dtype = next(self.qwen_model.parameters()).dtype
+        for k, v in inputs.items():
+            if hasattr(v, 'to'):
+                if v.dtype in (torch.float32, torch.float64, torch.bfloat16, torch.float16):
+                    inputs[k] = v.to(device=self.analysis_device, dtype=model_dtype)
+                else:
+                    inputs[k] = v.to(device=self.analysis_device)
+
+        with torch.no_grad():
+            output_ids = self.qwen_model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens
+            )
+
+        response = self.qwen_processor.batch_decode(
+            output_ids[:, inputs["input_ids"].shape[1]:],
+            skip_special_tokens=True
+        )[0]
+
+        del output_ids, inputs
+        return response
+
     def _parse_extraction(self, response: str) -> ExtractionResult:
         """Parse Qwen response into structured result."""
         scene_type = "aerial scene"
@@ -436,7 +408,7 @@ class SyntheticGenerationPipeline:
         layout = "Objects distributed across the scene"
         appearance = "Realistic aerial view"
         lighting = "Natural lighting"
-        
+
         for line in response.split('\n'):
             lower = line.lower().strip()
             if 'scene_type' in lower or 'scene type' in lower:
@@ -455,7 +427,7 @@ class SyntheticGenerationPipeline:
                 parts = line.split(':', 1)
                 if len(parts) > 1:
                     appearance = parts[1].strip()
-        
+
         return ExtractionResult(
             scene_type=scene_type or "aerial scene",
             object_inventory=objects or {"structures": 1},
@@ -464,36 +436,32 @@ class SyntheticGenerationPipeline:
             lighting_conditions=lighting,
             raw_analysis=response
         )
-    
+
     def _parse_objects(self, text: str) -> Dict[str, int]:
         """Parse object inventory string - handles multiple formats."""
         result = {}
-        # Split by commas or semicolons
         parts = text.replace(';', ',').split(',')
         for part in parts:
             part = part.strip()
             if ':' in part:
-                # Format: "object: count"
                 name, count = part.split(':', 1)
                 name = name.strip().lower()
                 try:
                     result[name] = int(count.strip().split()[0])
-                except:
+                except Exception:
                     result[name] = 1
             elif any(char.isdigit() for char in part):
-                # Format: "45 buildings" or "buildings 45"
                 words = part.split()
                 for i, word in enumerate(words):
                     if word.isdigit():
                         count = int(word)
-                        # Get the object name (other words)
                         name_words = [w for j, w in enumerate(words) if j != i]
                         name = ' '.join(name_words).strip().lower()
                         if name:
                             result[name] = count
                         break
         return result if result else {"structures": 1}
-    
+
     def _fallback_extraction(self) -> ExtractionResult:
         """Fallback when Qwen is unavailable."""
         return ExtractionResult(
@@ -504,56 +472,53 @@ class SyntheticGenerationPipeline:
             lighting_conditions="Natural lighting",
             raw_analysis="Fallback"
         )
-    
+
     # =========================================================================
-    # Stage 3: Grounding DINO Detection
+    # Stage 2: Grounding DINO Detection
     # =========================================================================
-    
-    def stage3_detection(self, image: Image.Image, objects: Dict[str, int]) -> DetectionResult:
+
+    def stage2_detection(self, image: Image.Image, objects: Dict[str, int]) -> DetectionResult:
         """Detect objects with Grounding DINO."""
         start = time.time()
-        
+
         if self.gdino_model is None:
             return self._fallback_detection()
-        
+
         try:
-            # Build text prompt
             text_prompt = ". ".join(objects.keys()) + "."
-            
-            # Process inputs - move to device (float32 model, no conversion needed)
+
             inputs = self.gdino_processor(
                 images=image,
                 text=text_prompt,
                 return_tensors="pt"
-            ).to(self.device)
-            
-            # Run model
+            ).to(self.analysis_device)
+
+            model_dtype = next(self.gdino_model.parameters()).dtype
+            if "pixel_values" in inputs and hasattr(inputs["pixel_values"], "to"):
+                inputs["pixel_values"] = inputs["pixel_values"].to(dtype=model_dtype)
+
             with torch.no_grad():
                 outputs = self.gdino_model(**inputs)
-            
-            # Post-process - get raw results first
-            target_sizes = torch.tensor([image.size[::-1]], device=self.device)
+
+            target_sizes = torch.tensor([image.size[::-1]], device=self.analysis_device)
             results = self.gdino_processor.post_process_grounded_object_detection(
                 outputs,
                 inputs.input_ids,
                 target_sizes=target_sizes
             )[0]
-            
-            # Filter by threshold manually
+
             threshold = self.synthetic_config.gdino_box_threshold
-            
+
             boxes = []
             labels = []
             scores_list = []
-            
+
             if 'scores' in results and len(results['scores']) > 0:
                 scores = results['scores']
-                
                 for i, score in enumerate(scores):
                     if score.item() >= threshold:
-                        boxes.append(results['boxes'][i].cpu().numpy().tolist())
+                        boxes.append(results['boxes'][i].float().cpu().numpy().tolist())
                         scores_list.append(score.item())
-                        # Handle labels
                         if 'labels' in results:
                             if isinstance(results['labels'], list):
                                 labels.append(str(results['labels'][i]))
@@ -561,34 +526,25 @@ class SyntheticGenerationPipeline:
                                 labels.append("object")
                         else:
                             labels.append("object")
-            
-            # Compute spatial relationships
+
             spatial = self._compute_spatial(boxes, labels)
-            
-            # Delete intermediate tensors immediately
+
             del outputs, inputs, target_sizes, results
-            torch.cuda.empty_cache()
-            
+
             result = DetectionResult(
                 boxes=boxes,
                 labels=labels,
                 scores=scores_list,
                 spatial_relationships=spatial
             )
-            
+
         except Exception as e:
-            print(f"    ⚠ Detection error: {e}")
-            import traceback
-            traceback.print_exc()
+            print(f"    \u26a0 Detection error: {e}")
             result = self._fallback_detection()
-        
-        self.stage_times["stage_3"].append(time.time() - start)
-        
-        # Cleanup GPU memory after stage
-        self._clear_gpu_memory()
-        
+
+        self.stage_times["stage_2"].append(time.time() - start)
         return result
-    
+
     def _compute_spatial(self, boxes: List, labels: List) -> List[str]:
         """Compute spatial relationships between objects."""
         relations = []
@@ -600,7 +556,7 @@ class SyntheticGenerationPipeline:
                 cy1 = (b1[1] + b1[3]) / 2
                 cx2 = (b2[0] + b2[2]) / 2
                 cy2 = (b2[1] + b2[3]) / 2
-                
+
                 if abs(cx1 - cx2) > 50 or abs(cy1 - cy2) > 50:
                     if cx1 < cx2 - 50:
                         relations.append(f"{l1} left of {l2}")
@@ -611,7 +567,7 @@ class SyntheticGenerationPipeline:
                     else:
                         relations.append(f"{l1} below {l2}")
         return relations[:10]
-    
+
     def _fallback_detection(self) -> DetectionResult:
         """Fallback when DINO is unavailable."""
         return DetectionResult(
@@ -620,552 +576,438 @@ class SyntheticGenerationPipeline:
             scores=[0.5],
             spatial_relationships=[]
         )
-    
+
     # =========================================================================
-    # Stage 4: SAM Segmentation
+    # Stage 3: Prompt Variant Generation (N prompts per source image)
     # =========================================================================
-    
-    def stage4_segmentation(self, image: Image.Image, detection: DetectionResult) -> SegmentationResult:
-        """Segment objects with SAM."""
+
+    # Style suffixes used to diversify the N prompt variants while keeping
+    # the underlying scene/object/layout content identical.
+    _STYLE_VARIANTS = [
+        "High resolution satellite imagery, sharp focus, natural colors, top-down orthographic view.",
+        "Ultra-detailed aerial photograph, crisp edges, true-to-life colors, nadir viewing angle.",
+        "Professional remote sensing imagery, fine detail, balanced exposure, straight-down perspective.",
+        "High-fidelity orbital photograph, clear atmosphere, accurate colors, vertical overhead view.",
+        "Detailed geospatial imagery, sharp resolution, realistic lighting, direct overhead shot.",
+    ]
+
+    def stage3_prompt_variants(
+        self, extraction: ExtractionResult, detection: DetectionResult
+    ) -> List[GeneratedPrompt]:
+        """Generate N diverse prompt variants for the image generator."""
         start = time.time()
-        
-        if self.sam_model is None or not detection.boxes:
-            return self._fallback_segmentation()
-        
-        try:
-            # Prepare boxes (limit to 10)
-            input_boxes = detection.boxes[:10]
-            
-            # Process inputs - move to device (float32 model, no conversion needed)
-            inputs = self.sam_processor(
-                image,
-                input_boxes=[input_boxes],
-                return_tensors="pt"
-            )
-            
-            # Move to device
-            for k, v in inputs.items():
-                if hasattr(v, 'to'):
-                    inputs[k] = v.to(self.device)
-            
-            # Run model
-            with torch.no_grad():
-                outputs = self.sam_model(**inputs)
-            
-            # Post-process masks
-            masks = self.sam_processor.post_process_masks(
-                outputs.pred_masks.cpu(),
-                inputs["original_sizes"].cpu(),
-                inputs["reshaped_input_sizes"].cpu(),
-                binarize=False
-            )
-            
-            # Extract mask data
-            mask_list = []
-            areas = []
-            
-            if masks and len(masks) > 0:
-                mask_tensor = masks[0]
-                if mask_tensor.dim() >= 2:
-                    num_masks = mask_tensor.shape[0] if mask_tensor.dim() > 2 else 1
-                    for i in range(min(num_masks, 10)):
-                        if mask_tensor.dim() > 3:
-                            m = mask_tensor[i, 0].numpy()
-                        elif mask_tensor.dim() > 2:
-                            m = mask_tensor[i].numpy()
-                        else:
-                            m = mask_tensor.numpy()
-                        m = m.squeeze()
-                        mask_list.append(m)
-                        areas.append(int((m > 0.5).sum()))
-            
-            # Delete intermediate tensors immediately
-            del outputs, inputs, masks
-            torch.cuda.empty_cache()
-            
-            result = SegmentationResult(
-                masks=mask_list,
-                boundaries=[[] for _ in mask_list],
-                areas=areas
-            )
-            
-        except Exception as e:
-            print(f"    ⚠ Segmentation error: {e}")
-            result = self._fallback_segmentation()
-        
-        self.stage_times["stage_4"].append(time.time() - start)
-        
-        # Cleanup GPU memory after stage
-        self._clear_gpu_memory()
-        
-        return result
-    
-    def _fallback_segmentation(self) -> SegmentationResult:
-        """Fallback when SAM is unavailable."""
-        return SegmentationResult(masks=[], boundaries=[], areas=[10000])
-    
+
+        n = self.synthetic_config.n_prompts_per_image
+        items = sorted(extraction.object_inventory.items(), key=lambda x: x[1], reverse=True)
+
+        prompts: List[GeneratedPrompt] = []
+        for i in range(n):
+            # Rotate object emphasis order per variant for content diversity
+            rotated = items[i % max(1, len(items)):] + items[:i % max(1, len(items))] if items else items
+            obj_parts = [f"{count} {obj}{'s' if count > 1 else ''}" for obj, count in rotated]
+            obj_text = ", ".join(obj_parts) if obj_parts else "structures"
+
+            spatial = ""
+            if detection.spatial_relationships:
+                offset = i % max(1, len(detection.spatial_relationships))
+                rotated_spatial = detection.spatial_relationships[offset:] + detection.spatial_relationships[:offset]
+                spatial = " " + ". ".join(rotated_spatial[:5]) + "."
+
+            full = f"Realistic aerial satellite photograph of {extraction.scene_type} area"
+            if obj_text:
+                full += f" with {obj_text}"
+            if extraction.layout_description:
+                full += f". {extraction.layout_description}"
+            if spatial:
+                full += spatial
+            if extraction.appearance_details and extraction.appearance_details != "Realistic aerial view":
+                full += f". Notable features: {extraction.appearance_details}"
+
+            style = self._STYLE_VARIANTS[i % len(self._STYLE_VARIANTS)]
+            full += f" {style}"
+
+            prompts.append(GeneratedPrompt(
+                full_prompt=full,
+                scene_component=f"aerial satellite view of {extraction.scene_type} area",
+                layout_component=extraction.layout_description + spatial,
+                object_component=f"containing {obj_text}" if obj_text else "structures",
+                style_component=style,
+                variant_index=i,
+            ))
+
+        self.stage_times["stage_3"].append(time.time() - start)
+        return prompts
+
     # =========================================================================
-    # Stage 5: Prompt Generation
+    # Stage 4: Image Generation (N images per source image)
     # =========================================================================
-    
-    def stage5_prompt(self, extraction: ExtractionResult, detection: DetectionResult, 
-                      segmentation: SegmentationResult) -> GeneratedPrompt:
-        """Generate SD prompt from extracted information."""
+
+    def stage4_generate(self, prompt: GeneratedPrompt, seed: int) -> Tuple[Optional[Image.Image], Dict]:
+        """Generate one image with the FLUX/SD3.5 generator."""
         start = time.time()
-        
-        # Build object description
-        obj_parts = []
-        for obj, count in sorted(extraction.object_inventory.items(), 
-                                  key=lambda x: x[1], reverse=True):
-            obj_parts.append(f"{count} {obj}{'s' if count > 1 else ''}")
-        obj_text = ", ".join(obj_parts) if obj_parts else "structures"
-        
-        # Build spatial description
-        spatial = ""
-        if detection.spatial_relationships:
-            spatial = " " + ". ".join(detection.spatial_relationships[:5]) + "."
-        
-        # Create realistic, detailed prompt focused on objects and layout
-        # Full prompt - realistic aerial image description
-        full = f"Realistic aerial satellite photograph of {extraction.scene_type} area"
-        
-        # Add detailed object inventory
-        if obj_text:
-            full += f" with {obj_text}"
-        
-        # Add layout and spatial information
-        if extraction.layout_description:
-            full += f". {extraction.layout_description}"
-        
-        if spatial:
-            full += spatial
-        
-        # Add key features if available
-        if extraction.appearance_details and extraction.appearance_details != "Realistic aerial view":
-            full += f". Notable features: {extraction.appearance_details}"
-        
-        # Add technical quality descriptors for realism
-        full += ". High resolution satellite imagery, sharp focus, natural colors, top-down orthographic view."
-        
-        # Components for metadata
-        scene = f"aerial satellite view of {extraction.scene_type} area"
-        layout = extraction.layout_description + spatial
-        objects = f"containing {obj_text}" if obj_text else "structures"
-        style = "realistic aerial photography"
-        
-        result = GeneratedPrompt(
-            full_prompt=full,
-            scene_component=scene,
-            layout_component=layout,
-            object_component=objects,
-            style_component=style
-        )
-        
-        self.stage_times["stage_5"].append(time.time() - start)
-        return result
-    
-    # =========================================================================
-    # Stage 6: Stable Diffusion Generation
-    # =========================================================================
-    
-    def stage6_generate(self, prompt: GeneratedPrompt) -> Tuple[Optional[Image.Image], Dict]:
-        """Generate image with Stable Diffusion."""
-        start = time.time()
-        
+
         if self.sd_pipeline is None:
-            return None, {"error": "SD not available"}
-        
+            return None, {"error": "Generator not available", "success": False}
+
         try:
+            generator = torch.Generator(device=self.gen_device).manual_seed(seed)
             params = {
                 "prompt": prompt.full_prompt,
-                "negative_prompt": "blurry, low quality, distorted, artifacts, watermark, text",
                 "num_inference_steps": self.synthetic_config.sd_steps,
                 "guidance_scale": self.synthetic_config.sd_guidance_scale,
                 "height": self.synthetic_config.sd_image_size,
                 "width": self.synthetic_config.sd_image_size,
+                "generator": generator,
             }
-            
+            # FLUX (distilled, guidance baked in) does not take a negative
+            # prompt the way SD3.5's CFG does.
+            if self.synthetic_config.sd_backend != "flux":
+                params["negative_prompt"] = "blurry, low quality, distorted, artifacts, watermark, text"
+
             with torch.no_grad():
                 output = self.sd_pipeline(**params)
-            
-            # Extract image from output
+
             if hasattr(output, 'images'):
                 image = output.images[0]
             elif isinstance(output, tuple):
                 image = output[0][0] if isinstance(output[0], list) else output[0]
             else:
                 image = output
-            
-            params["success"] = True
-            
+
+            log_params = {k: v for k, v in params.items() if k != "generator"}
+            log_params["seed"] = seed
+            log_params["success"] = True
+
         except Exception as e:
-            print(f"    ⚠ Generation error: {e}")
+            print(f"    \u26a0 Generation error: {e}")
             image = None
-            params = {"error": str(e), "success": False}
-        
-        self.stage_times["stage_6"].append(time.time() - start)
-        
-        # Cleanup GPU memory after stage
-        self._clear_gpu_memory()
-        
-        return image, params
-    
+            log_params = {"error": str(e), "success": False, "seed": seed}
+
+        self.stage_times["stage_4"].append(time.time() - start)
+        return image, log_params
+
     # =========================================================================
-    # Stages 7-9: Verification (reuse stages 2-4)
+    # Stage 5: Multi-Caption Generation (M captions per generated image)
     # =========================================================================
-    
-    def stage7_verify_scene(self, image: Image.Image) -> ExtractionResult:
-        """Verify generated image with second-pass analysis."""
+
+    def stage5_captions(self, image: Image.Image, extraction: ExtractionResult) -> List[str]:
+        """Ask Qwen2.5-VL for N diverse captions describing the actual generated image."""
         start = time.time()
-        result = self.stage2_scene_analysis(image)
-        self.stage_times["stage_7"].append(time.time() - start)
-        return result
-    
-    def stage8_verify_detection(self, image: Image.Image, objects: Dict[str, int]) -> DetectionResult:
-        """Verify with second-pass detection."""
-        start = time.time()
-        result = self.stage3_detection(image, objects)
-        self.stage_times["stage_8"].append(time.time() - start)
-        return result
-    
-    def stage9_verify_segmentation(self, image: Image.Image, detection: DetectionResult) -> SegmentationResult:
-        """Verify with second-pass segmentation."""
-        start = time.time()
-        result = self.stage4_segmentation(image, detection)
-        self.stage_times["stage_9"].append(time.time() - start)
-        return result
-    
-    # =========================================================================
-    # Stage 10: Quality Scoring & Refinement
-    # =========================================================================
-    
-    def stage10_score_and_refine(
-        self,
-        image: Image.Image,
-        prompt: GeneratedPrompt,
-        orig_ext: ExtractionResult,
-        orig_det: DetectionResult,
-        verify_ext: ExtractionResult,
-        verify_det: DetectionResult
-    ) -> Tuple[str, QualityScores]:
-        """Compute quality scores and generate refined caption - LoRA Training Mode."""
-        start = time.time()
-        
-        # LoRA Training Mode: All images pass, no quality filtering
-        # CLIP score always 1.0 (disabled)
-        clip_score = 1.0
-        
-        # Layout IoU - still computed for metadata
-        layout_iou = self._layout_iou(orig_det.boxes, verify_det.boxes)
-        
-        # Object count accuracy - still computed for metadata
-        obj_acc = self._object_accuracy(orig_ext.object_inventory, verify_ext.object_inventory)
-        
-        # Always pass in LoRA training mode
-        scores = QualityScores(
-            clip_score=clip_score,
-            layout_iou=layout_iou,
-            object_count_accuracy=obj_acc,
-            all_checks_passed=True,  # Always pass
-            details={"note": "Quality scoring disabled - LoRA training mode"}
-        )
-        
-        # Generate caption
-        caption = self._generate_caption(verify_ext, verify_det)
-        
-        self.stage_times["stage_10"].append(time.time() - start)
-        
-        # Cleanup GPU memory after stage
-        self._clear_gpu_memory()
-        
-        return caption, scores
-    
-    def _clip_score(self, image: Image.Image, text: str) -> float:
-        """CLIP scoring disabled for LoRA training mode."""
-        return 1.0  # Always return perfect score
-    
-    def _layout_iou(self, boxes1: List, boxes2: List) -> float:
-        """Compute average IoU between box sets."""
-        if not boxes1 or not boxes2:
-            return 0.5
-        
-        def iou(b1, b2):
-            x1 = max(b1[0], b2[0])
-            y1 = max(b1[1], b2[1])
-            x2 = min(b1[2], b2[2])
-            y2 = min(b1[3], b2[3])
-            inter = max(0, x2-x1) * max(0, y2-y1)
-            a1 = (b1[2]-b1[0]) * (b1[3]-b1[1])
-            a2 = (b2[2]-b2[0]) * (b2[3]-b2[1])
-            union = a1 + a2 - inter
-            return inter / union if union > 0 else 0
-        
-        total = 0
-        used = set()
-        for b1 in boxes1:
-            best = 0
-            best_idx = -1
-            for idx, b2 in enumerate(boxes2):
-                if idx not in used:
-                    score = iou(b1, b2)
-                    if score > best:
-                        best = score
-                        best_idx = idx
-            if best_idx >= 0:
-                used.add(best_idx)
-                total += best
-        
-        return total / len(boxes1)
-    
-    def _object_accuracy(self, orig: Dict[str, int], synth: Dict[str, int]) -> float:
-        """Compute object count accuracy."""
-        if not orig:
-            return 1.0
-        total_orig = sum(orig.values())
-        total_synth = sum(synth.values())
-        if total_orig == 0:
-            return 1.0
-        return min(total_orig, total_synth) / max(total_orig, total_synth)
-    
-    def _generate_caption(self, ext: ExtractionResult, det: DetectionResult) -> str:
-        """Generate refined caption."""
-        obj_parts = []
-        for obj, count in sorted(ext.object_inventory.items(), key=lambda x: x[1], reverse=True):
-            obj_parts.append(f"{count} {obj}{'s' if count > 1 else ''}")
-        obj_text = ", ".join(obj_parts) if obj_parts else "structures"
-        
-        spatial = ""
-        if det.spatial_relationships:
-            spatial = " " + ". ".join(det.spatial_relationships[:3]) + "."
-        
+
+        n = self.synthetic_config.n_captions_per_image
+        captions: List[str] = []
+
+        if self.qwen_model is not None:
+            try:
+                prompt = (
+                    f"Write {n} diverse, natural-language captions describing this aerial/satellite "
+                    f"image, for use in training an image-text retrieval model. "
+                    f"Each caption must be a single, information-dense sentence. "
+                    f"Vary emphasis across captions (scene type, dominant objects and counts, "
+                    f"spatial layout, visual style). Output exactly {n} lines, each formatted as:\n"
+                    f"CAPTION_i: <caption text>"
+                )
+                response = self._qwen_generate(image, prompt, max_new_tokens=64 * n)
+                captions = self._parse_captions(response, n)
+            except Exception as e:
+                print(f"    \u26a0 Captioning error: {e}")
+                captions = []
+
+        # Pad with deterministic template captions if the VLM under-produced
+        while len(captions) < n:
+            captions.append(self._template_caption(extraction, variant=len(captions)))
+        captions = captions[:n]
+
+        self.stage_times["stage_5"].append(time.time() - start)
+        return captions
+
+    def _parse_captions(self, response: str, n: int) -> List[str]:
+        """Parse 'CAPTION_i: ...' lines out of a Qwen response."""
+        captions = []
+        for line in response.split('\n'):
+            line = line.strip()
+            if not line:
+                continue
+            if ':' in line:
+                head, tail = line.split(':', 1)
+                if 'caption' in head.lower() and tail.strip():
+                    captions.append(tail.strip())
+
+        if not captions:
+            # Model didn't follow the "CAPTION_i:" format - fall back to
+            # treating each non-empty line as its own caption.
+            captions = [l.strip('- ').strip() for l in response.split('\n') if l.strip()]
+
+        return captions[:n]
+
+    def _template_caption(self, ext: ExtractionResult, variant: int = 0) -> str:
+        """Deterministic fallback caption built from structured extraction."""
+        items = sorted(ext.object_inventory.items(), key=lambda x: x[1], reverse=True)
+        if items:
+            offset = variant % len(items)
+            rotated = items[offset:] + items[:offset]
+            obj_parts = [f"{count} {obj}{'s' if count > 1 else ''}" for obj, count in rotated[:5]]
+            obj_text = ", ".join(obj_parts)
+        else:
+            obj_text = "structures"
         return (
             f"Aerial satellite image of {ext.scene_type} area with {obj_text}. "
-            f"{ext.layout_description}.{spatial} "
-            f"{ext.appearance_details} under {ext.lighting_conditions}."
+            f"{ext.layout_description}. {ext.appearance_details} under {ext.lighting_conditions}."
         )
-    
+
     # =========================================================================
-    # Main Processing
+    # Stage 6: Metadata persistence
     # =========================================================================
-    
-    def setup(self):
-        """Initialize pipeline."""
-        print("\n" + "="*70)
-        print("SYNTHETIC PIPELINE INITIALIZED")
-        print("="*70)
-        print(f"Device: {self.device}")
-        print(f"Free GPU Memory: {self._get_free_memory():.1f} GB")
-        print("Models will load on-demand")
-        print("="*70)
-    
-    def load_models(self):
-        """Compatibility method - models load lazily."""
-        pass
-    
-    def process_image(self, image_path: Path) -> Optional[SyntheticSample]:
-        """Process single image through all stages."""
-        try:
-            sample_id = str(uuid.uuid4())[:8]
-            source = Image.open(image_path).convert('RGB')
-            
-            # Stage 2: Scene analysis
-            print("    Stage 2: Scene analysis...")
-            extraction = self.stage2_scene_analysis(source)
-            
-            # Stage 3: Detection
-            print("    Stage 3: Detection...")
-            detection = self.stage3_detection(source, extraction.object_inventory)
-            
-            # Stage 4: Segmentation
-            print("    Stage 4: Segmentation...")
-            segmentation = self.stage4_segmentation(source, detection)
-            
-            # Stage 5: Prompt generation
-            print("    Stage 5: Prompt generation...")
-            prompt = self.stage5_prompt(extraction, detection, segmentation)
-            
-            # Stage 6: Image generation
-            print("    Stage 6: Image generation...")
-            synthetic, gen_params = self.stage6_generate(prompt)
-            
-            if synthetic is None:
-                self.failed_count += 1
-                return None
-            
-            # Stage 7-9: Verification
-            print("    Stage 7-9: Verification...")
-            verify_ext = self.stage7_verify_scene(synthetic)
-            verify_det = self.stage8_verify_detection(synthetic, extraction.object_inventory)
-            verify_seg = self.stage9_verify_segmentation(synthetic, verify_det)
-            
-            # Stage 10: Caption generation (no quality checks)
-            print("    Stage 10: Caption generation...")
-            caption, scores = self.stage10_score_and_refine(
-                synthetic, prompt, extraction, detection, verify_ext, verify_det
-            )
-            
-            # Save synthetic image
-            synth_path = self.synthetic_dir / f"synthetic_{sample_id}.png"
-            synthetic.save(synth_path)
-            
-            # Create sample
-            sample = SyntheticSample(
-                sample_id=sample_id,
-                source_image_path=str(image_path),
-                synthetic_image_path=str(synth_path),
-                original_extraction=extraction,
-                original_detection=detection,
-                original_segmentation=segmentation,
-                generated_prompt=prompt,
-                generation_params=gen_params,
-                verification_extraction=verify_ext,
-                verification_detection=verify_det,
-                verification_segmentation=verify_seg,
-                quality_scores=scores,
-                refined_caption=caption
-            )
-            
-            # Save metadata
-            self._save_metadata(sample)
-            
-            self.processed_count += 1
-            # Always pass in LoRA mode - no quality filtering
-            self.passed_count += 1
-            
-            # Final cleanup after processing image
-            self._clear_gpu_memory()
-            
-            return sample
-            
-        except Exception as e:
-            print(f"    ✗ Error: {e}")
-            import traceback
-            traceback.print_exc()
-            self.failed_count += 1
-            
-            # Cleanup even on error
-            self._clear_gpu_memory()
-            
-            return None
-    
-    # Alias for compatibility
-    def process_single_image(self, image_path: Path) -> Optional[SyntheticSample]:
-        """Alias for process_image for backward compatibility."""
-        return self.process_image(image_path)
-    
+
     def _save_metadata(self, sample: SyntheticSample):
-        """Save sample metadata."""
+        """Save per-source-image metadata (all generated images + captions)."""
+        start = time.time()
         path = self.metadata_dir / f"{sample.sample_id}.json"
         data = {
             "sample_id": sample.sample_id,
             "source_image_path": sample.source_image_path,
-            "synthetic_image_path": sample.synthetic_image_path,
             "original_extraction": asdict(sample.original_extraction),
             "original_detection": asdict(sample.original_detection),
-            "generated_prompt": asdict(sample.generated_prompt),
-            "generation_params": sample.generation_params,
-            "verification_extraction": asdict(sample.verification_extraction),
-            "quality_scores": asdict(sample.quality_scores),
-            "refined_caption": sample.refined_caption,
+            "generated_images": [asdict(r) for r in sample.generated_images],
             "created_at": sample.created_at,
             "pipeline_version": sample.pipeline_version
         }
         with open(path, 'w') as f:
             json.dump(data, f, indent=2)
-    
+        self.stage_times["stage_6"].append(time.time() - start)
+
+    # =========================================================================
+    # Main Processing
+    # =========================================================================
+
+    def setup(self):
+        """Initialize pipeline (models already loaded in __init__)."""
+        print("\n" + "="*70)
+        print("SYNTHETIC PIPELINE READY")
+        print("="*70)
+        print(f"Generator device: {self.gen_device}")
+        print(f"Analysis device:  {self.analysis_device}")
+        print("="*70)
+
+    def load_models(self):
+        """Compatibility no-op - models are loaded eagerly in __init__."""
+        pass
+
+    def analyze_source(self, image_path: Path) -> Tuple[Image.Image, ExtractionResult, DetectionResult, List[GeneratedPrompt]]:
+        """Stages 1-3: scene analysis, detection, prompt-variant generation.
+
+        Runs entirely on `analysis_device` (GPU1) and is safe to call from
+        the background prefetch thread while GPU0 generates images for a
+        different source image.
+        """
+        source = Image.open(image_path).convert('RGB')
+        extraction = self.stage1_scene_analysis(source)
+        detection = self.stage2_detection(source, extraction.object_inventory)
+        prompts = self.stage3_prompt_variants(extraction, detection)
+        return source, extraction, detection, prompts
+
+    def process_source_image(
+        self,
+        image_path: Path,
+        precomputed: Optional[Tuple[Image.Image, ExtractionResult, DetectionResult, List[GeneratedPrompt]]] = None,
+    ) -> Optional[SyntheticSample]:
+        """Process one source image through stages 4-6, producing
+        n_prompts_per_image synthetic images each with n_captions_per_image
+        captions.
+        """
+        try:
+            sample_id = str(uuid.uuid4())[:8]
+
+            if precomputed is not None:
+                _source, extraction, detection, prompts = precomputed
+            else:
+                _source, extraction, detection, prompts = self.analyze_source(image_path)
+
+            base_seed = random.randint(0, 2**31 - 1)
+
+            image_records: List[GeneratedImageRecord] = []
+            for prompt in prompts:
+                image, gen_params = self.stage4_generate(prompt, seed=base_seed + prompt.variant_index)
+
+                if image is None:
+                    self.failed_count += 1
+                    continue
+
+                captions = self.stage5_captions(image, extraction)
+
+                image_id = f"{sample_id}_{prompt.variant_index}"
+                synth_path = self.synthetic_dir / f"synthetic_{image_id}.png"
+                image.save(synth_path)
+
+                image_records.append(GeneratedImageRecord(
+                    image_id=image_id,
+                    image_path=str(synth_path),
+                    prompt=prompt,
+                    generation_params=gen_params,
+                    captions=captions,
+                ))
+                self.passed_count += 1
+
+            self.processed_count += 1
+
+            sample = SyntheticSample(
+                sample_id=sample_id,
+                source_image_path=str(image_path),
+                original_extraction=extraction,
+                original_detection=detection,
+                generated_images=image_records,
+            )
+
+            self._save_metadata(sample)
+            self._clear_gpu_memory()
+
+            return sample
+
+        except Exception as e:
+            print(f"    \u2717 Error processing {image_path}: {e}")
+            import traceback
+            traceback.print_exc()
+            self.failed_count += 1
+            self._clear_gpu_memory()
+            return None
+
+    # Alias for backward compatibility
+    def process_image(self, image_path: Path) -> Optional[SyntheticSample]:
+        return self.process_source_image(image_path)
+
     def run(self, source_images: List[Path]) -> Dict[str, Any]:
-        """Run pipeline on list of images."""
+        """Run pipeline over source images, prefetching analysis for image
+        i+1 (GPU1) while generating + captioning image i (GPU0/GPU1)."""
+        target_images = self.synthetic_config.target_synthetic_count
+
         print("\n" + "="*70)
         print("SYNTHETIC GENERATION PIPELINE")
         print("="*70)
-        print(f"Images: {len(source_images)}")
-        print(f"Target: {self.synthetic_config.target_synthetic_count}")
-        print(f"Mode: LoRA Training (All images accepted - no quality filtering)")
+        print(f"Source images available: {len(source_images)}")
+        print(f"Prompts/image: {self.synthetic_config.n_prompts_per_image}  "
+              f"Captions/image: {self.synthetic_config.n_captions_per_image}")
+        print(f"Target synthetic images: {target_images}  "
+              f"(-> {target_images * self.synthetic_config.n_captions_per_image} pairs)")
+        print("Mode: LoRA Training (all generated images accepted)")
         print("="*70)
-        
-        samples = []
-        for i, path in enumerate(source_images):
-            if self.passed_count >= self.synthetic_config.target_synthetic_count:
-                print(f"\n✓ Target reached: {self.passed_count}")
+
+        samples: List[SyntheticSample] = []
+        n = len(source_images)
+
+        if n == 0:
+            return {"processed": 0, "passed": 0, "failed": 0, "quality_rate": 0.0, "samples": []}
+
+        futures = {0: self._prefetch_executor.submit(self.analyze_source, source_images[0])}
+
+        i = 0
+        while i < n:
+            if self.passed_count >= target_images:
+                print(f"\n\u2713 Target reached: {self.passed_count} images")
                 break
-            
-            print(f"\n[{i+1}/{len(source_images)}] {path.name}")
-            sample = self.process_image(path)
-            
+
+            precomputed = futures.pop(i).result()
+
+            if (i + 1) < n:
+                futures[i + 1] = self._prefetch_executor.submit(self.analyze_source, source_images[i + 1])
+
+            print(f"\n[{i+1}/{n}] {source_images[i].name}")
+            sample = self.process_source_image(source_images[i], precomputed=precomputed)
+
             if sample:
                 samples.append(sample)
-                print(f"  ✓ Generated successfully (LoRA mode - no quality filter)")
+                print(f"  \u2713 {len(sample.generated_images)} images generated "
+                      f"({self.synthetic_config.n_captions_per_image} captions each)")
             else:
-                print(f"  ✗ Generation failed")
-            
+                print("  \u2717 Generation failed")
+
             if (i + 1) % 10 == 0:
-                rate = self.passed_count / max(1, self.processed_count) * 100
-                print(f"\n--- Progress: {self.passed_count}/{self.processed_count} ({rate:.1f}%) ---")
-        
-        # Summary
+                print(f"\n--- Progress: {self.passed_count}/{target_images} images "
+                      f"({self.processed_count} source images processed) ---")
+
+            i += 1
+
+        # Cancel any pending prefetch
+        for f in futures.values():
+            f.cancel()
+
         print("\n" + "="*70)
         print("COMPLETE")
         print("="*70)
-        print(f"Processed: {self.processed_count}")
-        print(f"Passed: {self.passed_count}")
-        print(f"Failed: {self.failed_count}")
-        print(f"Rate: {self.passed_count/max(1,self.processed_count)*100:.1f}%")
-        
-        # Timing
+        print(f"Source images processed: {self.processed_count}")
+        print(f"Synthetic images generated: {self.passed_count}")
+        print(f"Failed generations: {self.failed_count}")
+
         print("\nStage Timing (avg):")
         for stage, times in self.stage_times.items():
             if times:
                 print(f"  {stage}: {sum(times)/len(times):.2f}s")
-        
+
         return {
             "processed": self.processed_count,
             "passed": self.passed_count,
             "failed": self.failed_count,
-            "quality_rate": self.passed_count / max(1, self.processed_count),
+            "quality_rate": 1.0 if self.passed_count else 0.0,
             "samples": samples
         }
-    
-    def generate_dataset(self, source_images_dir: Path = None, output_dir: Path = None, 
+
+    def generate_dataset(self, source_images_dir: Path = None, output_dir: Path = None,
                          target_count: Optional[int] = None, source_dir: Path = None) -> Dict[str, Any]:
-        """Generate synthetic dataset from source directory."""
-        # Support both parameter names for compatibility
+        """Generate synthetic dataset from source directory.
+
+        `target_count` (if given) overrides the number of synthetic *images*
+        to generate (not pairs). Total pairs = images * n_captions_per_image.
+        """
         source_path = source_images_dir or source_dir
         if source_path is None:
             raise ValueError("Must provide source_images_dir or source_dir")
-        
+
         if target_count:
             self.synthetic_config.target_synthetic_count = target_count
-        
-        # Collect images
+
         images = []
         for ext in ['*.jpg', '*.jpeg', '*.png', '*.bmp', '*.tif', '*.tiff']:
             images.extend(source_path.glob(ext))
             images.extend(source_path.glob(ext.upper()))
-        
+
         if not images:
             print(f"No images in {source_path}")
-            return {"generated": 0, "samples": []}
-        
-        # Run
+            return {"generated": 0, "pairs_generated": 0, "samples": []}
+
+        # Respect n_source_images cap if fewer/more are available than requested
+        max_sources = self.synthetic_config.n_source_images
+        if max_sources and len(images) > max_sources:
+            images = images[:max_sources]
+
         result = self.run(images)
-        
-        # Save manifest
+
         manifest_path = self.metadata_dir / "dataset.json"
         samples = result.get("samples", [])
-        manifest = {
-            "pairs": [{
-                "image_path": str(s.synthetic_image_path),
-                "caption": s.refined_caption,
-                "quality_scores": asdict(s.quality_scores),
-                "image_id": s.sample_id
-            } for s in samples]
-        }
+
+        pairs = []
+        for s in samples:
+            for rec in s.generated_images:
+                for cap_idx, caption in enumerate(rec.captions):
+                    pairs.append({
+                        "image_path": rec.image_path,
+                        "caption": caption,
+                        "image_id": rec.image_id,
+                        "caption_id": f"{rec.image_id}_{cap_idx}",
+                        "sample_id": s.sample_id,
+                        "quality_scores": {"clip_score": 1.0},
+                    })
+
+        manifest = {"pairs": pairs}
         with open(manifest_path, 'w') as f:
             json.dump(manifest, f, indent=2)
-        
+
+        print(f"\nManifest: {len(samples)} source images -> "
+              f"{result.get('passed', 0)} synthetic images -> {len(pairs)} image-caption pairs")
+        print(f"Saved to: {manifest_path}")
+
         return {
             "generated": result.get("passed", 0),
+            "pairs_generated": len(pairs),
             "quality_rate": result.get("quality_rate", 0.0),
             "manifest_path": str(manifest_path),
-            "samples": samples  # Include samples for run_stage1.py compatibility
+            "samples": samples
         }

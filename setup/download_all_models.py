@@ -1,208 +1,306 @@
 #!/usr/bin/env python3
 """
-Pre-download ALL models for the synthetic pipeline.
-Run this separately before running the main pipeline.
-Downloads models one at a time to avoid VRAM issues.
+Pre-download ALL HuggingFace models used by the RemoteCLIP pipeline.
+
+Saves each repo under:
+    <repo_root>/models/<org>__<name>/
+
+No GPU required — this only downloads weights/config/tokenizer files.
+
+Usage (from the clip repo root):
+    python setup/download_all_models.py
+    python setup/download_all_models.py --skip-gated   # skip FLUX / SD3.5 if you
+                                                      # have not accepted licenses yet
+    python setup/download_all_models.py --only qwen,flux
+
+Gated models (accept the license on HuggingFace first, then set HF_TOKEN):
+    https://huggingface.co/black-forest-labs/FLUX.1-dev
+    https://huggingface.co/stabilityai/stable-diffusion-3.5-large
 """
+from __future__ import annotations
+
+import argparse
 import os
 import sys
-import gc
-import torch
 from pathlib import Path
-from dotenv import load_dotenv
+from typing import Dict, List, Optional
 
-# Load environment
-load_dotenv()
+# ---------------------------------------------------------------------------
+# Paths
+# ---------------------------------------------------------------------------
 
-# Login to HuggingFace
-hf_token = os.getenv('HF_TOKEN')
-if not hf_token:
-    print("ERROR: HF_TOKEN not found in .env file")
-    sys.exit(1)
-
-try:
-    from huggingface_hub import login
-    login(token=hf_token)
-    print("✓ Logged in to HuggingFace")
-except Exception as e:
-    print(f"ERROR: Failed to login to HuggingFace: {e}")
-    sys.exit(1)
-
-# Check CUDA
-if not torch.cuda.is_available():
-    print("ERROR: CUDA not available")
-    sys.exit(1)
-
-print("\n" + "="*70)
-print("MODEL DOWNLOADER - ALL PIPELINE MODELS")
-print("="*70)
-
-# Get cache directory - use absolute path
-cache_dir = os.getenv('HF_HOME')
-if cache_dir:
-    # Remove Windows-style paths if present (D:/ or C:/ etc)
-    cache_dir = cache_dir.replace('\\', '/')
-    if ':' in cache_dir and cache_dir[1] == ':':
-        # Windows path detected, use default instead
-        print(f"WARNING: Windows path detected in HF_HOME: {cache_dir}")
-        cache_dir = None
-
-if not cache_dir:
-    # Always use absolute path relative to script location
-    script_dir = Path(__file__).parent.resolve()
-    cache_dir = str(script_dir / 'checkpoints' / 'huggingface')
-
-cache_path = Path(cache_dir).resolve()
-print(f"Cache directory: {cache_path}")
-
-# Create cache directory if it doesn't exist
-cache_path.mkdir(parents=True, exist_ok=True)
-print()
-
-def get_free_memory():
-    if torch.cuda.is_available():
-        free, total = torch.cuda.mem_get_info(0)
-        return free / (1024**3), total / (1024**3)
-    return 0, 0
-
-def clear_memory():
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize()
-
-# Models to download
-models = [
-    {
-        "name": "Qwen2-VL-2B-Instruct",
-        "id": "Qwen/Qwen2-VL-2B-Instruct",
-        "type": "transformers",
-        "class": "Qwen2VLForConditionalGeneration"
-    },
-    {
-        "name": "Grounding DINO",
-        "id": "IDEA-Research/grounding-dino-base",
-        "type": "transformers",
-        "class": "AutoModelForZeroShotObjectDetection"
-    },
-    {
-        "name": "SAM ViT-Huge",
-        "id": "facebook/sam-vit-huge",
-        "type": "transformers",
-        "class": "SamModel"
-    },
-    {
-        "name": "Stable Diffusion 3.5 Medium",
-        "id": "stabilityai/stable-diffusion-3.5-medium",
-        "type": "diffusers",
-        "class": "StableDiffusion3Pipeline"
-    }
+REPO_ROOT = Path(__file__).resolve().parent.parent
+MODELS_DIR = REPO_ROOT / "models"
+ENV_CANDIDATES = [
+    REPO_ROOT / ".env",
+    Path(__file__).resolve().parent / ".env",
 ]
 
-print(f"Will download {len(models)} models sequentially")
-print("(CLIP removed - quality scoring disabled for LoRA training)")
-print()
-print("NOTE: SD 3.5 is GATED - you must accept license first:")
-print("  https://huggingface.co/stabilityai/stable-diffusion-3.5-medium")
-print()
 
-for i, model in enumerate(models, 1):
-    print("="*70)
-    print(f"[{i}/{len(models)}] {model['name']}")
-    print("="*70)
-    
-    free, total = get_free_memory()
-    print(f"Free GPU Memory: {free:.1f}/{total:.1f} GB")
-    
+def _load_dotenv() -> None:
     try:
-        if model['type'] == 'transformers':
-            print(f"Downloading from HuggingFace: {model['id']}")
-            
-            if 'Qwen' in model['class']:
-                from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
-                print("  - Downloading processor...")
-                processor = AutoProcessor.from_pretrained(
-                    model['id'],
-                    trust_remote_code=True,
-                    cache_dir=cache_dir
-                )
-                print("  - Downloading model...")
-                mdl = Qwen2VLForConditionalGeneration.from_pretrained(
-                    model['id'],
-                    torch_dtype=torch.float16,
-                    device_map="auto",
-                    trust_remote_code=True,
-                    low_cpu_mem_usage=True,
-                    cache_dir=cache_dir
-                )
-                del processor, mdl
-                
-            elif 'ZeroShot' in model['class']:
-                from transformers import AutoProcessor, AutoModelForZeroShotObjectDetection
-                print("  - Downloading processor...")
-                processor = AutoProcessor.from_pretrained(
-                    model['id'],
-                    cache_dir=cache_dir
-                )
-                print("  - Downloading model...")
-                mdl = AutoModelForZeroShotObjectDetection.from_pretrained(
-                    model['id'],
-                    torch_dtype=torch.float16,
-                    low_cpu_mem_usage=True,
-                    cache_dir=cache_dir
-                )
-                del processor, mdl
-                
-            elif 'Sam' in model['class']:
-                from transformers import SamModel, SamProcessor
-                print("  - Downloading processor...")
-                processor = SamProcessor.from_pretrained(
-                    model['id'],
-                    cache_dir=cache_dir
-                )
-                print("  - Downloading model...")
-                mdl = SamModel.from_pretrained(
-                    model['id'],
-                    torch_dtype=torch.float16,
-                    low_cpu_mem_usage=True,
-                    cache_dir=cache_dir
-                )
-                del processor, mdl
-        
-        elif model['type'] == 'diffusers':
-            from diffusers import StableDiffusion3Pipeline
-            print(f"Downloading from HuggingFace: {model['id']}")
-            print("  - Downloading pipeline (this is large ~10GB)...")
-            pipeline = StableDiffusion3Pipeline.from_pretrained(
-                model['id'],
-                torch_dtype=torch.float16,
-                variant="fp16",
-                cache_dir=cache_dir
-            )
-            del pipeline
-        
-        print(f"✓ {model['name']} downloaded successfully!")
-        
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+    for env_path in ENV_CANDIDATES:
+        if env_path.exists():
+            load_dotenv(env_path)
+            print(f"Loaded env from {env_path}")
+            return
+
+
+def _local_dir_for(repo_id: str, models_dir: Optional[Path] = None) -> Path:
+    """Map 'org/name' -> models/org__name (Windows-safe, flat folder)."""
+    root = models_dir if models_dir is not None else MODELS_DIR
+    return root / repo_id.replace("/", "__")
+
+
+# ---------------------------------------------------------------------------
+# Model catalog (kept in sync with remoteclip_pipeline/config.py)
+# ---------------------------------------------------------------------------
+
+MODELS: List[Dict] = [
+    # --- Synthetic generation pipeline (A100 x2 build) ---
+    {
+        "key": "qwen",
+        "name": "Qwen2.5-VL-7B-Instruct",
+        "repo_id": "Qwen/Qwen2.5-VL-7B-Instruct",
+        "gated": False,
+        "notes": "Scene analysis + multi-caption generation (analysis GPU)",
+    },
+    {
+        "key": "gdino",
+        "name": "Grounding DINO Base",
+        "repo_id": "IDEA-Research/grounding-dino-base",
+        "gated": False,
+        "notes": "Object / layout detection for prompts + captions",
+    },
+    {
+        "key": "flux",
+        "name": "FLUX.1-dev",
+        "repo_id": "black-forest-labs/FLUX.1-dev",
+        "gated": True,
+        "notes": "Primary image generator (gen GPU). ~24GB download.",
+        "license_url": "https://huggingface.co/black-forest-labs/FLUX.1-dev",
+    },
+    {
+        "key": "sd35",
+        "name": "Stable Diffusion 3.5 Large",
+        "repo_id": "stabilityai/stable-diffusion-3.5-large",
+        "gated": True,
+        "notes": "Optional SD3.5 fallback (set sd_backend='sd3' in config).",
+        "license_url": "https://huggingface.co/stabilityai/stable-diffusion-3.5-large",
+    },
+    # --- Zoom-crops pipeline (still used by Stage 1B) ---
+    {
+        "key": "sam",
+        "name": "SAM ViT-Huge",
+        "repo_id": "facebook/sam-vit-huge",
+        "gated": False,
+        "notes": "Used by zoom_crops_pipeline.py for object masks",
+    },
+    # --- LoRA training backbone ---
+    {
+        "key": "remoteclip",
+        "name": "RemoteCLIP-ViT-B-32",
+        "repo_id": "chendelong/RemoteCLIP",
+        "gated": False,
+        "notes": "RemoteCLIP backbone checkpoint used by Stage 2/3 trainers",
+        # Only the ViT-B-32 weight is needed; skip the larger ViT-L/H variants.
+        "allow_patterns": ["RemoteCLIP-ViT-B-32.pt", "README.md", "*.json", "*.txt"],
+    },
+]
+
+
+# ---------------------------------------------------------------------------
+# Download helpers
+# ---------------------------------------------------------------------------
+
+def _login_hf(token: Optional[str]) -> None:
+    if not token:
+        print(
+            "WARNING: HF_TOKEN not set. Public models will still download; "
+            "gated models (FLUX / SD3.5) will fail until you set HF_TOKEN "
+            "and accept their licenses on HuggingFace."
+        )
+        return
+    try:
+        from huggingface_hub import login
+        login(token=token, add_to_git_credential=False)
+        print("Logged in to HuggingFace")
     except Exception as e:
-        print(f"✗ Failed to download {model['name']}: {e}")
-        import traceback
-        traceback.print_exc()
-        print("\nContinuing with next model...")
-    
-    # Clear memory before next model
-    print("  - Clearing GPU memory...")
-    clear_memory()
-    
-    free_after, _ = get_free_memory()
-    print(f"  - Free GPU Memory after cleanup: {free_after:.1f} GB")
+        print(f"ERROR: HuggingFace login failed: {e}")
+        sys.exit(1)
+
+
+def _download_one(
+    model: Dict,
+    token: Optional[str],
+    force: bool,
+    models_dir: Path,
+) -> bool:
+    """Download one model repo into models/<org>__<name>/. Returns success."""
+    from huggingface_hub import snapshot_download
+
+    repo_id = model["repo_id"]
+    local_dir = _local_dir_for(repo_id, models_dir)
+    local_dir.mkdir(parents=True, exist_ok=True)
+
+    print(f"  Repo:      {repo_id}")
+    print(f"  Local dir: {local_dir}")
+    if model.get("notes"):
+        print(f"  Notes:     {model['notes']}")
+    if model.get("gated"):
+        print(f"  License:   {model.get('license_url', 'see HuggingFace page')}")
+
+    # Skip if already present and not forcing (heuristic: any weight file exists)
+    if not force and _looks_downloaded(local_dir):
+        print("  SKIP: already present (use --force to re-download)")
+        return True
+
+    try:
+        kwargs = {
+            "repo_id": repo_id,
+            "local_dir": str(local_dir),
+            "token": token,
+            "resume_download": True,
+            "max_workers": 8,
+        }
+        if model.get("allow_patterns"):
+            kwargs["allow_patterns"] = model["allow_patterns"]
+
+        snapshot_download(**kwargs)
+        print(f"  OK: {model['name']}")
+        return True
+    except Exception as e:
+        print(f"  FAIL: {model['name']}: {e}")
+        if model.get("gated"):
+            print(
+                "  Hint: accept the model license on HuggingFace, then ensure "
+                "HF_TOKEN has access to this repo."
+            )
+        return False
+
+
+def _looks_downloaded(local_dir: Path) -> bool:
+    """True if the folder already contains weight-like files."""
+    if not local_dir.exists():
+        return False
+    weight_globs = ("*.safetensors", "*.bin", "*.pt", "*.ckpt", "*.msgpack")
+    for pattern in weight_globs:
+        if any(local_dir.rglob(pattern)):
+            return True
+    return False
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Download all RemoteCLIP pipeline models into ./models/"
+    )
+    parser.add_argument(
+        "--models-dir",
+        type=str,
+        default=str(MODELS_DIR),
+        help=f"Destination root (default: {MODELS_DIR})",
+    )
+    parser.add_argument(
+        "--only",
+        type=str,
+        default=None,
+        help=(
+            "Comma-separated keys to download. "
+            f"Available: {', '.join(m['key'] for m in MODELS)}"
+        ),
+    )
+    parser.add_argument(
+        "--skip-gated",
+        action="store_true",
+        help="Skip gated models (FLUX.1-dev, SD3.5 Large)",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-download even if weight files already exist locally",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    _load_dotenv()
+
+    models_dir = Path(args.models_dir).resolve()
+    models_dir.mkdir(parents=True, exist_ok=True)
+
+    token = os.getenv("HF_TOKEN") or os.getenv("HUGGING_FACE_HUB_TOKEN")
+    _login_hf(token)
+
+    selected = MODELS
+    if args.only:
+        keys = {k.strip().lower() for k in args.only.split(",") if k.strip()}
+        unknown = keys - {m["key"] for m in MODELS}
+        if unknown:
+            print(f"ERROR: unknown model keys: {sorted(unknown)}")
+            print(f"Available: {[m['key'] for m in MODELS]}")
+            return 1
+        selected = [m for m in MODELS if m["key"] in keys]
+
+    if args.skip_gated:
+        selected = [m for m in selected if not m.get("gated")]
+
+    print()
+    print("=" * 70)
+    print("REMOTECLIP MODEL DOWNLOADER")
+    print("=" * 70)
+    print(f"Destination: {models_dir}")
+    print(f"Models:      {len(selected)}")
+    for m in selected:
+        tag = " [GATED]" if m.get("gated") else ""
+        print(f"  - {m['key']}: {m['repo_id']}{tag}")
+    print("=" * 70)
     print()
 
-print("="*70)
-print("DOWNLOAD COMPLETE")
-print("="*70)
-print("✓ All models cached!")
-print(f"✓ Location: {cache_path}")
-print()
-print("You can now run run_stage1.py")
-print("Models will load much faster from cache!")
-print("="*70)
+    results: Dict[str, bool] = {}
+    for i, model in enumerate(selected, 1):
+        print("-" * 70)
+        print(f"[{i}/{len(selected)}] {model['name']}")
+        print("-" * 70)
+        ok = _download_one(model, token=token, force=args.force, models_dir=models_dir)
+        results[model["key"]] = ok
+        print()
+
+    print("=" * 70)
+    print("DOWNLOAD SUMMARY")
+    print("=" * 70)
+    ok_count = sum(1 for v in results.values() if v)
+    for model in selected:
+        status = "OK" if results.get(model["key"]) else "FAILED"
+        print(f"  [{status}] {model['key']} -> {_local_dir_for(model['repo_id'], models_dir)}")
+    print()
+    print(f"{ok_count}/{len(results)} succeeded")
+    print(f"Models root: {models_dir}")
+    print()
+    print("Point the pipeline at local paths, e.g.:")
+    print(
+        "  SyntheticConfig.qwen_model  = "
+        f"'{_local_dir_for('Qwen/Qwen2.5-VL-7B-Instruct', models_dir)}'"
+    )
+    print(
+        "  SyntheticConfig.sd_model    = "
+        f"'{_local_dir_for('black-forest-labs/FLUX.1-dev', models_dir)}'"
+    )
+    print(
+        "  SyntheticConfig.gdino_model = "
+        f"'{_local_dir_for('IDEA-Research/grounding-dino-base', models_dir)}'"
+    )
+    print("=" * 70)
+
+    return 0 if all(results.values()) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

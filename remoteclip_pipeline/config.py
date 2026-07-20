@@ -11,52 +11,67 @@ from typing import List, Dict, Any, Optional
 
 @dataclass
 class SyntheticConfig:
-    """Configuration for synthetic data generation pipeline."""
-    
-    # Real-ESRGAN settings
-    esrgan_scale: int = 4
-    esrgan_batch_size: int = 4
-    esrgan_model: str = "realesrgan-x4plus"
-    
-    # Qwen2-VL settings
-    qwen_model: str = "Qwen/Qwen2-VL-2B-Instruct"  # 2B model for memory efficiency
+    """Configuration for synthetic data generation pipeline.
+
+    Tuned for 2x NVIDIA A100 (80GB) + 7 CPU cores. The generator model
+    (image synthesis) is placed on `gen_device` and the analysis models
+    (VLM captioner + detector) are placed on `analysis_device`, so both
+    GPUs stay busy across the per-image loop.
+
+    Fan-out: for each source image, `n_prompts_per_image` prompt variants
+    are generated -> that many synthetic images -> each image gets
+    `n_captions_per_image` distinct captions. So:
+        images_generated  = n_source_images * n_prompts_per_image
+        pairs_generated   = images_generated * n_captions_per_image
+    Defaults below (10,000 source images x 5 prompts x 5 captions) yield
+    50,000 images / 250,000 image-caption pairs.
+    """
+
+    # Device placement (multi-GPU)
+    gen_device: str = "cuda:0"        # image generator (heaviest single model)
+    analysis_device: str = "cuda:1"   # VLM captioner + detector
+
+    # Qwen2.5-VL settings (captioning / scene analysis)
+    qwen_model: str = "Qwen/Qwen2.5-VL-7B-Instruct"
+    qwen_dtype: str = "bfloat16"
     qwen_max_tokens: int = 512
-    
-    # Grounding DINO settings
+
+    # Grounding DINO settings (object/spatial grounding for prompts+captions)
     gdino_model: str = "IDEA-Research/grounding-dino-base"
-    gdino_batch_size: int = 16
+    gdino_dtype: str = "bfloat16"
     gdino_confidence: float = 0.35
     gdino_box_threshold: float = 0.35
     gdino_text_threshold: float = 0.25
-    
-    # SAM settings
-    sam_model: str = "facebook/sam-vit-huge"
-    sam_checkpoint: Optional[str] = None
-    
-    # SD 3.5 settings
-    sd_model: str = "stabilityai/stable-diffusion-3.5-medium"
-    sd_steps: int = 50
-    sd_guidance_scale: float = 7.5
-    sd_controlnet_scale: float = 0.8
+
+    # Image generator settings (FLUX.1-dev preferred; SD3.5-Large fallback)
+    sd_model: str = "black-forest-labs/FLUX.1-dev"
+    sd_backend: str = "flux"  # "flux" | "sd3"
+    sd_dtype: str = "bfloat16"
+    sd_steps: int = 28
+    sd_guidance_scale: float = 3.5
     sd_image_size: int = 1024
-    
-    # Quality thresholds
-    min_clip_score: float = 0.75
-    min_layout_iou: float = 0.6
-    min_object_count_accuracy: float = 0.8
-    target_quality_rate: float = 0.85
-    
-    # Queue settings
-    queue_buffer_depth: int = 32
-    
+
+    # Fan-out settings
+    n_source_images: int = 10000
+    n_prompts_per_image: int = 5
+    n_captions_per_image: int = 5
+
     # Output settings
-    target_synthetic_count: int = 4500
+    target_synthetic_count: int = 50000  # = n_source_images * n_prompts_per_image
     save_intermediate: bool = True
-    
+
+    # CPU settings (7 cores available; leave 1 free for the OS/IO)
+    cpu_threads: int = 6
+
     @property
     def target_count(self) -> int:
         """Alias for target_synthetic_count."""
         return self.target_synthetic_count
+
+    @property
+    def target_pair_count(self) -> int:
+        """Total image-caption pairs = images * captions per image."""
+        return self.target_synthetic_count * self.n_captions_per_image
 
 
 @dataclass

@@ -526,8 +526,9 @@ def parse_args():
     parser.add_argument(
         "--synthetic-count",
         type=int,
-        default=5000,
-        help="Target synthetic sample count"
+        default=50000,
+        help="Target synthetic image count (each image gets "
+             "n_captions_per_image captions, so pairs = this * n_captions_per_image)"
     )
     
     parser.add_argument(
